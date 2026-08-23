@@ -5,9 +5,11 @@ from datetime import UTC, datetime
 from io import BytesIO
 from math import isfinite
 from typing import TYPE_CHECKING, Any
+from xml.etree.ElementTree import ParseError as XMLParseError
 
 import podcastparser
 from aiohttp.client import ClientError, ClientTimeout
+from defusedxml.ElementTree import fromstring as parse_xml
 from music_assistant_models.enums import ContentType, ImageType, LinkType, MediaType
 from music_assistant_models.errors import MediaNotFoundError
 from music_assistant_models.media_items import (
@@ -84,9 +86,14 @@ async def get_podcastparser_dict(
         )
     feed_stream = BytesIO(feed_data)
     try:
-        return podcastparser.parse(feed_url, feed_stream, max_episodes=max_episodes)  # type: ignore[no-any-return]
+        parsed: dict[str, Any] = podcastparser.parse(
+            feed_url, feed_stream, max_episodes=max_episodes
+        )
     except podcastparser.FeedParseError:
         raise MediaNotFoundError(f"The url at {feed_url} returns invalid RSS data.")
+    # enrich with transcript data that podcastparser does not capture
+    _inject_episode_transcripts(feed_data, parsed)
+    return parsed
 
 
 async def get_cached_podcast(
@@ -391,6 +398,9 @@ def parse_podcast_episode(
         if _chapters:
             mass_episode.metadata.chapters = _chapters
 
+    if episode.get("transcripts"):
+        mass_episode.metadata.has_transcript = True
+
     # cover image
     if episode_cover is not None:
         mass_episode.metadata.images = UniqueList(
@@ -593,3 +603,70 @@ async def _fetch_transcript(*, session: aiohttp.ClientSession, url: str) -> str 
     except (ClientError, TimeoutError) as err:
         LOGGER.warning("Failed to fetch podcast transcript from %s: %s", url, err)
         return None
+
+
+def find_episode_transcripts(
+    parsed_feed: dict[str, Any], guid_or_stream_url: str
+) -> list[dict[str, Any]] | None:
+    """
+    Return the transcript entries for an episode in a parsed feed, or None.
+
+    :param parsed_feed: The podcastparser dict (with transcripts injected).
+    :param guid_or_stream_url: Episode part of the item_id, see parse_podcast_episode.
+    """
+    for episode in parsed_feed.get("episodes", []):
+        try:
+            stream_url, guid = get_stream_url_and_guid_from_episode(episode=episode)
+        except ValueError:
+            continue
+        if guid_or_stream_url == (stream_url if guid is None else guid):
+            return episode.get("transcripts") or None
+    return None
+
+
+# Podcasting 2.0 namespace used by the podcast:transcript tag
+_PODCAST_NS = "https://podcastindex.org/namespace/1.0"
+_PODCAST_NS_PREFIXES = [f"{{{_PODCAST_NS}}}", "podcast:"]
+
+
+def _inject_episode_transcripts(feed_data: bytes, parsed: dict[str, Any]) -> None:
+    """
+    Extract podcast:transcript tags from the raw RSS XML into the parsed episode dicts.
+
+    podcastparser only captures a single transcript URL and drops the MIME type, so this
+    re-parses the XML to get all entries with their url, type and language attributes.
+
+    :param feed_data: The raw RSS feed bytes.
+    :param parsed: The podcastparser dict whose episode entries will be enriched in place.
+    """
+    try:
+        root = parse_xml(feed_data)
+    except XMLParseError, ValueError:
+        return
+
+    channel = root.find("channel")
+    if channel is None:
+        return
+
+    # collect transcripts per item in document order
+    items_transcripts: list[list[dict[str, str]]] = []
+    for item in channel.iter("item"):
+        transcripts: list[dict[str, str]] = []
+        for child in item:
+            tag = child.tag
+            if not any(tag == f"{prefix}transcript" for prefix in _PODCAST_NS_PREFIXES):
+                continue
+            url = child.get("url")
+            if not url:
+                continue
+            entry: dict[str, str] = {"url": url}
+            if mime_type := child.get("type"):
+                entry["type"] = mime_type
+            if language := child.get("language"):
+                entry["language"] = language
+            transcripts.append(entry)
+        items_transcripts.append(transcripts)
+
+    for episode, transcripts in zip(parsed.get("episodes", []), items_transcripts, strict=False):
+        if transcripts:
+            episode["transcripts"] = transcripts

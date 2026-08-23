@@ -8,8 +8,10 @@ from aiohttp.client import ClientError
 from music_assistant_models.enums import LinkType
 
 from music_assistant.helpers.podcast_parsers import (
+    _inject_episode_transcripts,
     enrich_episode_chapters,
     find_episode_stream_url,
+    find_episode_transcripts,
     get_cached_podcast,
     get_episode_transcript,
     get_podcastparser_dict,
@@ -726,3 +728,108 @@ async def test_transcript_fetch_error_is_swallowed() -> None:
         provider_instance_id="podcastfeed--test",
         transcripts=[{"url": TRANSCRIPT_URL, "type": "text/vtt"}],
     ) == (None, None)
+
+
+# --- RSS transcript extraction -------------------------------------------------------------------
+
+
+RSS_FEED_WITH_TRANSCRIPTS = b"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:podcast="https://podcastindex.org/namespace/1.0">
+<channel>
+<title>Test Podcast</title>
+<item>
+<title>Episode with transcripts</title>
+<guid>ep-1</guid>
+<enclosure url="https://example.com/ep1.mp3" type="audio/mpeg" length="1"/>
+<podcast:transcript url="https://example.com/ep1.vtt" type="text/vtt" language="en"/>
+<podcast:transcript url="https://example.com/ep1.srt" type="application/srt"/>
+</item>
+<item>
+<title>Episode without transcripts</title>
+<guid>ep-2</guid>
+<enclosure url="https://example.com/ep2.mp3" type="audio/mpeg" length="1"/>
+</item>
+</channel>
+</rss>
+"""
+
+
+def test_inject_episode_transcripts_extracts_all_entries() -> None:
+    """All podcast:transcript tags for an episode are extracted with url and type."""
+    parsed: dict[str, Any] = {
+        "episodes": [{"guid": "ep-1"}, {"guid": "ep-2"}],
+    }
+    _inject_episode_transcripts(RSS_FEED_WITH_TRANSCRIPTS, parsed)
+    assert parsed["episodes"][0]["transcripts"] == [
+        {"url": "https://example.com/ep1.vtt", "type": "text/vtt", "language": "en"},
+        {"url": "https://example.com/ep1.srt", "type": "application/srt"},
+    ]
+    assert "transcripts" not in parsed["episodes"][1]
+
+
+def test_inject_episode_transcripts_survives_invalid_xml() -> None:
+    """Malformed XML does not crash, the episodes are left untouched."""
+    parsed: dict[str, Any] = {"episodes": [{"guid": "ep-1"}]}
+    _inject_episode_transcripts(b"not xml at all", parsed)
+    assert "transcripts" not in parsed["episodes"][0]
+
+
+def test_inject_episode_transcripts_skips_entries_without_url() -> None:
+    """A podcast:transcript tag without a url attribute is ignored."""
+    feed = b"""\
+<?xml version="1.0"?>
+<rss version="2.0" xmlns:podcast="https://podcastindex.org/namespace/1.0">
+<channel><item>
+<guid>ep-1</guid>
+<enclosure url="https://example.com/ep1.mp3" type="audio/mpeg" length="1"/>
+<podcast:transcript type="text/vtt"/>
+<podcast:transcript url="https://example.com/ep1.srt" type="application/srt"/>
+</item></channel></rss>
+"""
+    parsed: dict[str, Any] = {"episodes": [{"guid": "ep-1"}]}
+    _inject_episode_transcripts(feed, parsed)
+    assert len(parsed["episodes"][0]["transcripts"]) == 1
+
+
+def test_parse_podcast_episode_sets_has_transcript_from_transcripts() -> None:
+    """When the episode dict carries a transcripts list, has_transcript is set."""
+    ep = _episode(transcripts=[{"url": "https://example.com/t.vtt", "type": "text/vtt"}])
+    mass_episode = _parse(ep)
+    assert mass_episode is not None
+    assert mass_episode.metadata.has_transcript is True
+
+
+def test_parse_podcast_episode_leaves_has_transcript_unset_without_transcripts() -> None:
+    """Without transcripts in the dict, has_transcript stays at the model default."""
+    mass_episode = _parse(_episode())
+    assert mass_episode is not None
+    assert not mass_episode.metadata.has_transcript
+
+
+def test_find_episode_transcripts_matches_by_guid() -> None:
+    """find_episode_transcripts looks up an episode by guid and returns its transcripts."""
+    transcripts = [{"url": "https://example.com/t.vtt", "type": "text/vtt"}]
+    feed: dict[str, Any] = {
+        "episodes": [
+            _episode(guid="ep-1", transcripts=transcripts),
+            _episode(guid="ep-2"),
+        ]
+    }
+    assert find_episode_transcripts(feed, "ep-1") == transcripts
+    assert find_episode_transcripts(feed, "ep-2") is None
+    assert find_episode_transcripts(feed, "ep-3") is None
+
+
+async def test_get_podcastparser_dict_injects_transcripts() -> None:
+    """Transcripts from podcast:transcript tags are injected into the parsed feed."""
+    session = _FakeFeedSession(body=RSS_FEED_WITH_TRANSCRIPTS)
+    parsed_feed = await get_podcastparser_dict(
+        session=cast("aiohttp.ClientSession", session), feed_url=FEED_URL
+    )
+    episodes = parsed_feed["episodes"]
+    assert episodes[0]["transcripts"] == [
+        {"url": "https://example.com/ep1.vtt", "type": "text/vtt", "language": "en"},
+        {"url": "https://example.com/ep1.srt", "type": "application/srt"},
+    ]
+    assert "transcripts" not in episodes[1]
