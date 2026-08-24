@@ -4,6 +4,9 @@
       "label": "Allow User Self-Registration",
       "description": "Allow users to create accounts via Home Assistant OAuth."
     },
+    "base_url_unreachable_warn": {
+      "label": "The configured Base URL below does not reach this server, so clients are pointed at {0} instead. \n\nCorrect the Base URL, or set it back to \"auto\" if you are not running Music Assistant behind a reverse proxy. \n\nNote that the URL must include the port, unless the server is reached on the default port of its protocol (80 for http, 443 for https)."
+    },
     "base_url": {
       "label": "Base URL",
       "description": "The (base) URL to reach this webserver in the network. \nThe default \"auto\" automatically resolves to the server's primary IP address and the configured port at startup. \nOverride this in advanced scenarios where for example you're running the webserver behind a reverse proxy."
@@ -45,6 +48,7 @@
     "description": "Configuration of the webserver and API"
   },
   "errors": {
-    "ssl_verification_failed": "Certificate verification failed: {0}"
+    "ssl_verification_failed": "Certificate verification failed: {0}",
+    "invalid_base_url": "Invalid Base URL: {0}. Enter a full URL including the protocol, for example http://192.168.1.5:8095."
   }
 }

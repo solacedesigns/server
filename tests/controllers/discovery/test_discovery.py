@@ -163,6 +163,39 @@ async def test_mass_service_advertises_webserver_publish_addresses(
     assert mock_service_info.call_args.kwargs["addresses"] == [b"192.168.1.10", b"fd00::10"]
 
 
+async def test_republish_updates_the_advertised_server_info(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """A base URL that changes without a reload must reach the network as an update."""
+    mass_minimal.webserver = MagicMock(
+        publish_ip="192.168.1.10",
+        publish_addresses=["192.168.1.10"],
+        publish_port=8095,
+        base_url="http://192.168.1.10:8095",
+    )
+    mock_zc = MagicMock(spec=AsyncZeroconf)
+    mock_zc.async_register_service = AsyncMock()
+    mock_zc.async_update_service = AsyncMock()
+    mass_minimal.discovery._aiozc = mock_zc
+
+    with (
+        patch("music_assistant.controllers.discovery.controller.AsyncServiceInfo"),
+        patch(
+            "music_assistant.controllers.discovery.controller.get_ip_pton",
+            new=AsyncMock(side_effect=lambda ip: ip.encode()),
+        ),
+    ):
+        # nothing is broadcast yet, so the first registration picks up the change by itself
+        await mass_minimal.discovery.republish_mass_service()
+        assert mock_zc.async_register_service.await_count == 0
+
+        await mass_minimal.discovery._register_mass_service()
+        await mass_minimal.discovery.republish_mass_service()
+
+    assert mock_zc.async_register_service.await_count == 1
+    assert mock_zc.async_update_service.await_count == 1
+
+
 async def test_async_find_mdns_service_matches_exact_device_name(mass: MusicAssistant) -> None:
     """A device name must not cross-match another device whose name contains it."""
     mass.discovery.aiozc.zeroconf.cache.cache = {

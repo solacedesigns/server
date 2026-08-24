@@ -134,6 +134,13 @@ class DiscoveryController(CoreController):
                 await aiozc.async_close()
             self._aiozc = None
 
+    async def republish_mass_service(self) -> None:
+        """Re-publish this server's mDNS record so clients pick up changed server info."""
+        if self._mass_service_info is None:
+            # not broadcasting (yet) - the first registration reads the current server info
+            return
+        await self._register_mass_service()
+
     async def run_provider_discovery(self, provider: ProviderInstanceType) -> None:
         """Run discovery for a specific provider."""
         if provider.manifest.mdns_discovery:

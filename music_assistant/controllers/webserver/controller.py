@@ -18,10 +18,12 @@ from collections.abc import Awaitable, Callable
 from concurrent import futures
 from contextlib import aclosing
 from functools import partial
+from ipaddress import ip_address
 from typing import TYPE_CHECKING, Any, Final, cast
+from urllib.parse import urlparse
 
 import aiofiles
-from aiohttp import web
+from aiohttp import ClientError, ClientTimeout, web
 from mashumaro.exceptions import MissingField
 from music_assistant_frontend import where as locate_frontend
 from music_assistant_models.api import CommandMessage
@@ -109,6 +111,13 @@ PREVIEW_TOKEN_TTL = 60
 # Ceiling on live preview tokens. LIBRARY_READ is a guest scope, so minting is reachable by
 # every signed-in client; the cap keeps a chatty or hostile one from growing the store.
 MAX_PREVIEW_TOKENS = 500
+# How long the probe of a configured base URL waits for an answer.
+BASE_URL_PROBE_TIMEOUT = 10
+# How often a base URL that was found unusable is probed again, so a reverse proxy that
+# only comes up after Music Assistant is adopted without needing a restart.
+BASE_URL_RECHECK_INTERVAL = 300
+BASE_URL_CHECK_TASK_ID = "webserver_base_url_check"
+BASE_URL_RECHECK_TIMER_ID = "webserver_base_url_recheck"
 
 
 def _get_publish_addresses(
@@ -164,6 +173,34 @@ def _locale_from_request(request: web.Request) -> str | None:
     return locale or None
 
 
+def _points_at_this_host(url: str, own_addresses: tuple[str, ...]) -> bool:
+    """
+    Return whether the URL's host is an IP address that this host itself holds.
+
+    A hostname never counts: it may resolve to something else here than it does for a
+    client on the network, so failing to reach it says nothing about the URL.
+
+    :param url: The URL to inspect.
+    :param own_addresses: The IP addresses of this host's network interfaces.
+    """
+    try:
+        hostname = urlparse(url).hostname
+        if not hostname:
+            return False
+        address = ip_address(hostname)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    own = set()
+    for candidate in own_addresses:
+        try:
+            own.add(ip_address(candidate))
+        except ValueError:
+            continue
+    return address in own
+
+
 class WebserverController(CoreController):
     """Core Controller that manages the builtin webserver that hosts the api and frontend."""
 
@@ -178,6 +215,10 @@ class WebserverController(CoreController):
         self.clients: set[WebsocketClientHandler] = set()
         # the URL that the "auto" base_url setting resolves to, detected at setup
         self._auto_base_url: str = ""
+        # whether a configured (non-auto) base_url was proven to reach this server
+        self._configured_base_url_usable: bool = True
+        # the base URL that was last handed to the mDNS broadcast, so a change can be spotted
+        self._advertised_base_url: str = ""
         # whether SSL is switched on in the config, resolved at setup
         self._ssl_configured: bool = False
         # whether the webserver actually serves TLS, resolved at setup
@@ -203,7 +244,10 @@ class WebserverController(CoreController):
         if config is None:
             return ""
         base_url = str(config.get_value(CONF_BASE_URL) or CONF_VALUE_AUTO)
-        if base_url == CONF_VALUE_AUTO:
+        # a configured URL that was proven not to reach this server is worse than no
+        # override at all: it is what clients are told to connect to, so hand out the
+        # auto-resolved URL until the setting is corrected
+        if base_url == CONF_VALUE_AUTO or not self._configured_base_url_usable:
             return self._auto_base_url
         return base_url.removesuffix("/")
 
@@ -399,8 +443,33 @@ class WebserverController(CoreController):
         # Setup remote access after webserver is running
         await self.remote_access.setup()
 
+        # a configured base URL is what clients are told to connect to, so check that it
+        # actually reaches us - in the background, it must not hold up startup
+        self._advertised_base_url = base_url
+        self.mass.create_task(
+            self._check_configured_base_url(),
+            task_id=BASE_URL_CHECK_TASK_ID,
+            abort_existing=True,
+        )
+
+    async def update_config(self, config: CoreConfig, changed_keys: set[str]) -> None:
+        """Handle logic when the config is updated."""
+        if f"values/{CONF_BASE_URL}" in changed_keys:
+            # raising here reverts the stored config, so validate before it is adopted
+            self._validate_base_url(str(config.get_value(CONF_BASE_URL) or CONF_VALUE_AUTO))
+        await super().update_config(config, changed_keys)
+        if f"values/{CONF_BASE_URL}" in changed_keys:
+            # the entry does not require a reload, so re-check and re-advertise here
+            self.mass.create_task(
+                self._check_configured_base_url(),
+                task_id=BASE_URL_CHECK_TASK_ID,
+                abort_existing=True,
+            )
+
     async def close(self) -> None:
         """Cleanup on exit."""
+        self.mass.cancel_timer(BASE_URL_RECHECK_TIMER_ID)
+        self.mass.cancel_task(BASE_URL_CHECK_TASK_ID)
         await self.remote_access.close()
         for client in set(self.clients):
             await client.disconnect()
@@ -590,6 +659,94 @@ class WebserverController(CoreController):
             f"{protocol}://{format_ip_for_url(self.publish_ip)}:{self.publish_port}"
         )
 
+    def _validate_base_url(self, value: str) -> None:
+        """
+        Raise when the given base URL cannot be used to reach this webserver.
+
+        :param value: The configured base URL, or "auto".
+        """
+        if value == CONF_VALUE_AUTO:
+            return
+        try:
+            parsed = urlparse(value)
+            is_absolute_http_url = parsed.scheme in ("http", "https") and bool(parsed.hostname)
+        except ValueError:
+            is_absolute_http_url = False
+        if not is_absolute_http_url:
+            raise InvalidDataError(
+                f"Invalid Base URL: {value}",
+                translation_key="invalid_base_url",
+                translation_args=[value],
+                translation_owner=self.translation_owner,
+            )
+
+    async def _check_configured_base_url(self) -> None:
+        """
+        Verify that a configured base URL reaches this server and fall back when it does not.
+
+        A base URL that does not reach us takes clients down with it: it is broadcast over
+        mDNS and the Home Assistant integration adopts the broadcast URL over the one the
+        user entered, so a stale or mistyped setting silently breaks the connection.
+        """
+        self.mass.cancel_timer(BASE_URL_RECHECK_TIMER_ID)
+        configured = str(self.config.get_value(CONF_BASE_URL) or CONF_VALUE_AUTO)
+        usable = True
+        if configured != CONF_VALUE_AUTO:
+            usable = await self._probe_base_url(configured.removesuffix("/")) is not False
+        was_usable = self._configured_base_url_usable
+        self._configured_base_url_usable = usable
+        if not usable:
+            self.logger.error(
+                "\n"
+                "################################################################################\n"
+                "\n"
+                "The configured Base URL %s does not reach this Music Assistant server.\n"
+                "Clients are pointed at %s instead until the setting is corrected\n"
+                "in Settings --> System --> Webserver.\n"
+                "\n"
+                "################################################################################\n",
+                configured,
+                self._auto_base_url,
+            )
+            # the reverse proxy behind it may simply not be up yet, so keep looking
+            self.mass.call_later(
+                BASE_URL_RECHECK_INTERVAL,
+                self._check_configured_base_url,
+                task_id=BASE_URL_RECHECK_TIMER_ID,
+            )
+        elif not was_usable:
+            self.logger.info("The configured Base URL %s reaches this server again.", configured)
+        if (base_url := self.base_url) != self._advertised_base_url:
+            self._advertised_base_url = base_url
+            await self.mass.discovery.republish_mass_service()
+
+    async def _probe_base_url(self, url: str) -> bool | None:
+        """
+        Return whether the given URL reaches this very server.
+
+        None means the probe was inconclusive - a reverse proxy may be reachable for clients
+        while it is not for us, so only a definitive answer may overrule the user's setting.
+
+        :param url: The base URL to probe.
+        """
+        try:
+            async with self.mass.http_session_no_ssl.get(
+                f"{url}/info", timeout=ClientTimeout(total=BASE_URL_PROBE_TIMEOUT)
+            ) as response:
+                if response.status != 200:
+                    # something is listening but does not hand out server info,
+                    # e.g. a proxy that keeps /info behind its own authentication
+                    return None
+                server_info = await response.json(content_type=None)
+        except TimeoutError, ClientError, OSError:
+            own_addresses = await get_ip_addresses(include_ipv6=True)
+            # nothing answered - conclusive only for an address we host ourselves
+            return False if _points_at_this_host(url, own_addresses) else None
+        except ValueError:
+            # answered, but not with the server info of a Music Assistant server
+            return False
+        return isinstance(server_info, dict) and server_info.get("server_id") == self.mass.server_id
+
     async def _build_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Build this module's config entries."""
         ip_addresses = await get_ip_addresses(include_ipv6=True)
@@ -600,6 +757,13 @@ class WebserverController(CoreController):
                 default_value=True,
                 hidden=not any(provider.domain == "hass" for provider in self.mass.providers),
                 requires_reload=False,
+            ),
+            ConfigEntry(
+                key="base_url_unreachable_warn",
+                type=ConfigEntryType.ALERT,
+                required=False,
+                hidden=self._configured_base_url_usable,
+                translation_params=[self._auto_base_url],
             ),
             ConfigEntry(
                 key=CONF_BASE_URL,
