@@ -311,7 +311,10 @@ class BuiltinProvider(MusicProvider):
             playlist_id = filename[:-4]  # strip .m3u extension
             try:
                 yield await self.get_playlist(playlist_id)
-            except MediaNotFoundError as err:
+            except (MediaNotFoundError, OSError, ValueError) as err:
+                # a single unreadable file (e.g. not utf-8, or no read permission) must not
+                # take the listing down with it: the builtin playlists below are yielded last,
+                # so they would never reach the library sync at all
                 self.report_skipped_sync_item(MediaType.PLAYLIST, playlist_id, err)
         # return builtin playlists
         for item_id in BUILTIN_PLAYLISTS:
@@ -1509,9 +1512,18 @@ class BuiltinProvider(MusicProvider):
         for filename in await asyncio.to_thread(os.listdir, self._playlists_dir):
             if not filename.endswith(".m3u"):
                 continue
+            if errors > 25:
+                raise RuntimeError("Too many errors during playlist migration")
             playlist_id = filename[:-4]  # strip .m3u extension
-            m3u_data = await self._read_m3u_file(playlist_id)
-            playlist = await self.get_playlist(playlist_id)
+            try:
+                m3u_data = await self._read_m3u_file(playlist_id)
+                playlist = await self.get_playlist(playlist_id)
+            except (MediaNotFoundError, OSError, ValueError) as err:
+                # one unreadable file must not stop the playlists after it from migrating
+                self.logger.warning("Could not read playlist file %s: %s", filename, err)
+                report_current_task_failure(f"Could not read playlist file: {filename}")
+                errors += 1
+                continue
             self.logger.debug("Checking playlist '%s' for unresolved entries...", playlist.name)
             update_current_task_progress_text(f"Checking playlist '{playlist.name}'")
             all_items = parse_m3u(m3u_data)
@@ -1591,8 +1603,6 @@ class BuiltinProvider(MusicProvider):
                     self._get_playlist_image_url(playlist),
                 )
                 self.logger.info("Updated playlist '%s' with enriched metadata", playlist.name)
-            if errors > 25:
-                raise RuntimeError("Too many errors during playlist migration")
         self.logger.info("Playlist migration completed with %d errors", errors)
         # if there were no errors, we can safely unregister the migration task
         if errors == 0 and (current_task_id := get_current_task_id()):
