@@ -28,8 +28,7 @@ import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from music_assistant_models.config_entries import ConfigEntry
-from music_assistant_models.enums import ConfigEntryType, EventType, MediaType, ProviderFeature
+from music_assistant_models.enums import EventType, MediaType, ProviderFeature
 
 from music_assistant.helpers.scrobbler import ScrobblerConfig
 from music_assistant.models.plugin import PluginProvider
@@ -44,7 +43,7 @@ from .helpers import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
     from music_assistant_models.event import MassEvent
     from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
     from music_assistant_models.provider import ProviderManifest
@@ -94,16 +93,12 @@ class ListeningHabitsProvider(PluginProvider):
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
-        return (
-            ConfigEntry(key=CONF_ENDPOINT, type=ConfigEntryType.STRING, required=True),
-            ConfigEntry(key=CONF_TOKEN, type=ConfigEntryType.SECURE_STRING, required=True),
-            ConfigEntry(
-                key=CONF_HOME_PLACE, type=ConfigEntryType.STRING, required=False, default_value=""
-            ),
-            # Borrowed from the shared scrobbler config: real per-user and
-            # per-player filtering, rendered by MA's own config UI.
-            *await ScrobblerConfig.get_shared_config_entries(self.mass, None),
-        )
+        # Only entries that resolve without user input belong here: options are
+        # validated against an empty value set when the instance is created, so
+        # a required entry with no default makes the provider impossible to
+        # load. The endpoint, token and home place are collected by the setup
+        # flow into setup_data instead, and read back via get_setup_value.
+        return tuple(await ScrobblerConfig.get_shared_config_entries(self.mass, None))
 
     async def handle_async_init(self) -> None:
         """Read configuration and prepare the backlog."""
