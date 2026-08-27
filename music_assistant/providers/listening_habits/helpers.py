@@ -69,6 +69,33 @@ def guess_device_type_and_room(display_name: str | None) -> tuple[str | None, st
     return None, None
 
 
+# `DeviceInfo` uses placeholder strings rather than None when a provider does
+# not report these, so they have to be treated as absent explicitly.
+_UNKNOWN_DEVICE_FIELDS = frozenset({"unknown model", "unknown manufacturer", ""})
+
+
+def device_type_from_model(manufacturer: str | None, model: str | None) -> tuple[str | None, bool]:
+    """
+    Derive (device_type, is_fixed) from a player's reported hardware.
+
+    Preferred over parsing the display name: the provider that created the
+    player knows what the hardware is, whereas a name like "Kitchen" carries
+    no model word at all. Returns (None, True) when nothing is reported.
+    """
+    parts = [
+        value
+        for value in (manufacturer, model)
+        if value and value.strip().lower() not in _UNKNOWN_DEVICE_FIELDS
+    ]
+    if not parts:
+        return None, True
+    text = " ".join(parts)
+    for pattern, label, fixed in DEVICE_TYPE_PATTERNS:
+        if pattern.search(text):
+            return label, fixed
+    return None, True
+
+
 class QualityCache:
     """
     Remembers each track's StreamDetails while it is still the current item.

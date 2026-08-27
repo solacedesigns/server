@@ -34,7 +34,12 @@ from music_assistant_models.enums import ConfigEntryType, EventType, MediaType, 
 from music_assistant.helpers.scrobbler import ScrobblerConfig
 from music_assistant.models.plugin import PluginProvider
 
-from .helpers import DurableQueue, QualityCache, guess_device_type_and_room
+from .helpers import (
+    DurableQueue,
+    QualityCache,
+    device_type_from_model,
+    guess_device_type_and_room,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -257,11 +262,20 @@ class ListeningHabitsProvider(PluginProvider):
             return None, None, None
         name = player.display_name
         device_type, room = guess_device_type_and_room(name)
-        if device_type is None and room is None:
-            # A room-level MA player is often named just "Kitchen" -- no model
-            # word to match, but the whole name is the room.
-            return None, name or None, name
-        return device_type, room, name
+        if device_type is not None:
+            return device_type, room, name
+        # The name carried no model word -- most players here are named for
+        # where they are ("Kitchen", "Hallway"), so the whole name is the room
+        # and the hardware has to come from the provider that created the
+        # player rather than from the text.
+        info = player.device_info
+        device_type, fixed = device_type_from_model(
+            info.manufacturer if info else None,
+            info.model if info else None,
+        )
+        # A device that gets carried around has no meaningful room, even
+        # though the name would otherwise read like one.
+        return device_type, (name or None) if fixed else None, name
 
     # ------------------------------------------------------------------
     # transport

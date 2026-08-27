@@ -13,6 +13,7 @@ import pytest
 from music_assistant.providers.listening_habits.helpers import (
     DurableQueue,
     QualityCache,
+    device_type_from_model,
     guess_device_type_and_room,
 )
 
@@ -90,3 +91,32 @@ async def test_durable_queue_survives_a_torn_write(tmp_path: Path) -> None:
     await asyncio.to_thread(Path(path).write_text, torn, encoding="utf-8")
 
     assert [entry["client_ref"] for entry in queue._read_sync()] == ["ma:1"]
+
+
+@pytest.mark.parametrize(
+    ("manufacturer", "model", "expected"),
+    [
+        # The common case this exists for: player named "Kitchen", hardware
+        # only knowable from what the provider reported.
+        ("Sonos", "Era 300", ("Sonos", True)),
+        ("Google", "Nest Mini", ("Google Nest Mini", True)),
+        ("WiiM", "WiiM Ultra", ("WiiM", True)),
+        # Carried hardware is typed but not placed.
+        ("Apple", "MacBook Pro", ("Mac", False)),
+        # DeviceInfo defaults to placeholder *strings*, not None, so these
+        # must not be treated as real hardware names.
+        ("Unknown Manufacturer", "Unknown model", (None, True)),
+        ("unknown manufacturer", "UNKNOWN MODEL", (None, True)),
+        (None, None, (None, True)),
+        ("", "", (None, True)),
+        # Reported but unrecognised hardware yields no guess rather than a bad one.
+        ("Acme Audio", "Widget 9", (None, True)),
+        # Manufacturer alone is enough when the model is a placeholder.
+        ("Sonos", "Unknown model", ("Sonos", True)),
+    ],
+)
+def test_device_type_from_model(
+    manufacturer: str | None, model: str | None, expected: tuple[str | None, bool]
+) -> None:
+    """Hardware reported by the provider is preferred over parsing the name."""
+    assert device_type_from_model(manufacturer, model) == expected
