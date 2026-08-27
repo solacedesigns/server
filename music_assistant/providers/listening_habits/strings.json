@@ -1,0 +1,19 @@
+{
+  "config_entries": {
+    "endpoint": {
+      "label": "Log endpoint",
+      "description": "Full URL of the Listening Habits ingest endpoint, e.g. https://example.org/api/listens"
+    },
+    "_token": {
+      "label": "Ingest token",
+      "description": "Must match the server's LHS_TOKEN."
+    },
+    "home_place_name": {
+      "label": "Home place name",
+      "description": "Place recorded for players that live in one room. Leave blank to record no place."
+    }
+  },
+  "manifest": {
+    "description": "Pushes every play to a self-hosted Listening Habits log, with real negotiated audio quality and live stream metadata."
+  }
+}

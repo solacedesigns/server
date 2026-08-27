@@ -1,0 +1,11 @@
+{
+  "type": "plugin",
+  "domain": "listening_habits",
+  "stage": "experimental",
+  "name": "Listening Habits",
+  "description": "Pushes every play to a self-hosted Listening Habits log, with real negotiated audio quality and live stream metadata.",
+  "codeowners": ["@solacedesigns"],
+  "multi_instance": false,
+  "builtin": false,
+  "requirements": []
+}
