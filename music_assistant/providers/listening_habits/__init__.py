@@ -306,13 +306,26 @@ class ListeningHabitsProvider(PluginProvider):
                 if response.status < 300:
                     self.logger.debug("logged %s - %s", payload.get("artist"), payload.get("title"))
                     return True
-                # 4xx is the server refusing this payload, not a transport
-                # problem -- retrying it forever would wedge the backlog behind
-                # a row that will never be accepted.
+                # An auth failure is a *configuration* error, not a bad
+                # payload: the play is perfectly good and will be accepted as
+                # soon as the token is corrected. Dropping it here is how a
+                # single mistyped token silently destroys every listen it
+                # touches, so these go to the backlog instead.
+                if response.status in (401, 403):
+                    self.logger.error(
+                        "server refused our token (%s), queued -- check the provider token "
+                        "matches LHS_TOKEN on the log server",
+                        response.status,
+                    )
+                    return False
+                # Any other 4xx is the server refusing this payload, not a
+                # transport problem -- retrying it forever would wedge the
+                # backlog behind a row that will never be accepted.
                 if 400 <= response.status < 500 and response.status not in (408, 429):
                     self.logger.error(
-                        "server rejected play (%s), dropping: %s",
+                        "server rejected play (%s: %s), dropping: %s",
                         response.status,
+                        (await response.text())[:200],
                         payload.get("client_ref"),
                     )
                     return True
