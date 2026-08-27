@@ -150,15 +150,33 @@ class ListeningHabitsProvider(PluginProvider):
     async def _on_media_item_played(self, event: MassEvent) -> None:
         """Handle a finished media item by logging it."""
         report: MediaItemPlaybackProgressReport = event.data
+        # This fires once per finished item, not once per progress tick, so an
+        # unconditional line here is cheap -- and without it a play that got
+        # filtered out is indistinguishable from an event that never arrived,
+        # which is the hardest kind of silence to debug.
+        self.logger.debug(
+            "played event: %s - %s (%s, fully_played=%s, player=%s)",
+            report.artist,
+            report.name,
+            report.media_type,
+            report.fully_played,
+            report.player_id,
+        )
 
         if report.media_type not in SUPPORTED_MEDIA_TYPES:
+            self.logger.debug("skipped: unsupported media type %s", report.media_type)
             return
         if not report.fully_played:
+            # MA requires 90% of a track before it counts as played, so a
+            # skipped track legitimately lands here.
+            self.logger.debug("skipped: not fully played (%s)", report.uri)
             return
         cfg = self._scrobbler_config
         if cfg.mass_userids and report.userid not in cfg.mass_userids:
+            self.logger.debug("skipped: user %s not in configured users", report.userid)
             return
         if cfg.mass_playerids and report.player_id not in cfg.mass_playerids:
+            self.logger.debug("skipped: player %s not in configured players", report.player_id)
             return
 
         payload = self._build_payload(report)
