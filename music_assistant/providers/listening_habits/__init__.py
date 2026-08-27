@@ -261,7 +261,9 @@ class ListeningHabitsProvider(PluginProvider):
             "source_type": "radio" if report.media_type is MediaType.RADIO else "streaming",
             # The actual streaming service, not the string "Music Assistant" --
             # this is what collapsed every row to one provider before.
-            "source_provider": streamdetails.provider if streamdetails else None,
+            "source_provider": self._describe_source_provider(
+                streamdetails.provider if streamdetails else None
+            ),
             "source_name": stream_meta.album if stream_meta else None,
             "source_app": "Music Assistant",
             "source_uri": report.uri,
@@ -294,6 +296,26 @@ class ListeningHabitsProvider(PluginProvider):
             "client_ref": f"ma:{report.player_id}:{int(played_at.timestamp())}",
             "ingest_method": "music_assistant",
         }
+
+    def _describe_source_provider(self, instance_id: str | None) -> str | None:
+        """Return a readable name for the streaming service, e.g. "Tidal"."""
+        if not instance_id:
+            return None
+        # `StreamDetails.provider` is an *instance* id -- the domain plus a
+        # suffix MA generated when that account was added, as in
+        # "tidal--PoeusMTs". Unique and stable while the account lives, but it
+        # reads like noise in a listening log, and the suffix is regenerated if
+        # the account is ever removed and re-added, which would quietly split
+        # one service into two in any group-by over the history.
+        provider = self.mass.get_provider(instance_id, return_unavailable=True)
+        if provider is None:
+            # An account that has since been deleted no longer resolves. Keep
+            # the raw id: unreadable beats losing the only record of where the
+            # audio came from.
+            return instance_id
+        # Honours a name set in MA's provider settings, and disambiguates a
+        # second account of the same service as "Tidal [2]".
+        return provider.name
 
     def _describe_player(self, player_id: str | None) -> tuple[str | None, str | None, str | None]:
         """Return (device_type, room, display_name) for the player that played this."""
