@@ -90,6 +90,8 @@ class ListeningHabitsProvider(PluginProvider):
         self._on_unload: list[Callable[[], None]] = []
         self._quality = QualityCache()
         self._retry_task: asyncio.Task[None] | None = None
+        # player_id -> uri of the last play counted for it; see _should_log.
+        self._last_counted: dict[str, str] = {}
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -147,6 +149,33 @@ class ListeningHabitsProvider(PluginProvider):
         if item.media_item and item.streamdetails:
             self._quality.remember(item.media_item.uri, item.streamdetails)
 
+    def _should_log(self, report: MediaItemPlaybackProgressReport) -> bool:
+        """
+        Return whether this report is a completed play we have not already logged.
+
+        MEDIA_ITEM_PLAYED is signalled on *every* progress report, outside the
+        `_should_mark_played` guard MA applies to its own playlog -- so a
+        consumer that does not repeat that logic double-counts. A track is
+        reported once as the current item as soon as it comes within 10s of the
+        end (`is_playing` still true), and again when the queue advances past
+        it; at end-of-queue the final track is reported twice over. Only the
+        report where playback has actually stopped is the real completion.
+
+        Keyed on uri because the report carries no queue_item_id, unlike the
+        guard upstream.
+        """
+        key = report.player_id or ""
+        if report.fully_played and not report.is_playing:
+            if self._last_counted.get(key) == report.uri:
+                return False
+            self._last_counted[key] = report.uri
+            return True
+        # A not-fully-played report for the same item means it started over
+        # (repeat one, or a manual seek back), so re-arm to count it again.
+        if not report.fully_played and self._last_counted.get(key) == report.uri:
+            del self._last_counted[key]
+        return False
+
     async def _on_media_item_played(self, event: MassEvent) -> None:
         """Handle a finished media item by logging it."""
         report: MediaItemPlaybackProgressReport = event.data
@@ -155,21 +184,25 @@ class ListeningHabitsProvider(PluginProvider):
         # filtered out is indistinguishable from an event that never arrived,
         # which is the hardest kind of silence to debug.
         self.logger.debug(
-            "played event: %s - %s (%s, fully_played=%s, player=%s)",
+            "played event: %s - %s (%s, fully_played=%s, is_playing=%s, player=%s)",
             report.artist,
             report.name,
             report.media_type,
             report.fully_played,
+            report.is_playing,
             report.player_id,
         )
 
         if report.media_type not in SUPPORTED_MEDIA_TYPES:
             self.logger.debug("skipped: unsupported media type %s", report.media_type)
             return
-        if not report.fully_played:
-            # MA requires 90% of a track before it counts as played, so a
-            # skipped track legitimately lands here.
-            self.logger.debug("skipped: not fully played (%s)", report.uri)
+        if not self._should_log(report):
+            self.logger.debug(
+                "skipped: %s (fully_played=%s, is_playing=%s)",
+                report.uri,
+                report.fully_played,
+                report.is_playing,
+            )
             return
         cfg = self._scrobbler_config
         if cfg.mass_userids and report.userid not in cfg.mass_userids:
