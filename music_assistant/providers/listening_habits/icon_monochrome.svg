@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="Listening Habits">
   <g fill="#ffffff">
-    <rect x="130" y="447" width="68" height="130" rx="34"/>
-    <rect x="246" y="398" width="68" height="228" rx="34"/>
-    <rect x="362" y="341" width="68" height="342" rx="34"/>
-    <rect x="478" y="421" width="68" height="182" rx="34"/>
-    <rect x="594" y="341" width="68" height="342" rx="34"/>
-    <rect x="710" y="398" width="68" height="228" rx="34"/>
-    <rect x="826" y="447" width="68" height="130" rx="34"/>
+    <rect x="129" y="445" width="70" height="134" rx="35"/>
+    <rect x="245" y="398" width="70" height="228" rx="35"/>
+    <rect x="361" y="341" width="70" height="342" rx="35"/>
+    <rect x="477" y="417" width="70" height="190" rx="35"/>
+    <rect x="593" y="341" width="70" height="342" rx="35"/>
+    <rect x="709" y="398" width="70" height="228" rx="35"/>
+    <rect x="825" y="445" width="70" height="134" rx="35"/>
   </g>
 </svg>
