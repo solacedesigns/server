@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import logging
+    from collections.abc import Iterable, Mapping
 
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -264,21 +265,36 @@ def on_air_station_slug(station_name: str | None) -> str | None:
     return None
 
 
-def on_air_url(ingest_endpoint: str, slug: str) -> str:
+def api_root(ingest_endpoint: str) -> str:
     """
-    Build the on-air URL that sits alongside a configured ingest endpoint.
+    Strip a configured ingest URL back to the root its sibling routes hang off.
 
-    The endpoint is configured as a full ingest URL ("https://host/api/ingest"),
-    and the on-air route is its sibling. Cutting at the last "/api/" rather
-    than replacing the whole path keeps a server mounted under a sub-path
-    ("https://host/lhs/api/ingest") working, which reaching for the bare origin
-    would break.
+    The endpoint is configured as a full ingest URL ("https://host/api/ingest").
+    Cutting at the last "/api/" rather than replacing the whole path keeps a
+    server mounted under a sub-path ("https://host/lhs/api/ingest") working,
+    which reaching for the bare origin would break.
     """
     marker = "/api/"
     base = ingest_endpoint.rstrip("/")
     cut = base.rfind(marker)
-    root = base[:cut] if cut != -1 else base
-    return f"{root}/api/on-air?station={slug}"
+    return base[:cut] if cut != -1 else base
+
+
+def on_air_url(ingest_endpoint: str, slug: str) -> str:
+    """Build the on-air URL that sits alongside a configured ingest endpoint."""
+    return f"{api_root(ingest_endpoint)}/api/on-air?station={slug}"
+
+
+def station_playlist_url(ingest_endpoint: str, slug: str, limit: int = 12) -> str:
+    """
+    Build the station-playlist URL that sits alongside a configured ingest endpoint.
+
+    A dozen plays is roughly an hour of radio -- far more history than an
+    identity match needs, but the log server serves the whole scraped page
+    either way, so a wider window costs nothing and covers a stream running
+    minutes behind the feed.
+    """
+    return f"{api_root(ingest_endpoint)}/api/station-playlist?station={slug}&limit={limit}"
 
 
 # Show names that mean "the station is just on", rather than a programme worth
@@ -300,3 +316,44 @@ def named_show(show_name: str | None) -> str | None:
     if not show or show.lower() in GENERIC_SHOWS:
         return None
     return show
+
+
+def icy_match_key(text: str | None) -> str:
+    """
+    Reduce a name to what two sources can be expected to agree on.
+
+    Case, spacing and punctuation all differ between an ICY string and a
+    playlist feed for the same song ("Tonight, Tonight" vs "Tonight Tonight"),
+    and none of that difference is meaningful.
+    """
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+def match_play(
+    icy_title: str | None, plays: Iterable[Mapping[str, Any]]
+) -> Mapping[str, Any] | None:
+    """
+    Find the logged play the stream's ICY title is naming, or None.
+
+    The Current sends "Title-Artist" with no spaces around the hyphen, which
+    cannot be split on the separator alone -- both halves routinely contain
+    hyphens of their own. So this does not split at all: it joins each
+    candidate play's own artist and title and asks whether the result is the
+    same string. Both orders are accepted because the station's ordering is an
+    observation, not a promise.
+
+    A miss is expected and normal, not an error: "The Current-" is what the
+    stream sends during a talk break, and it matches no song because no song
+    is playing.
+    """
+    key = icy_match_key(icy_title)
+    if not key:
+        return None
+    for play in plays:
+        artist = icy_match_key(play.get("artist"))
+        title = icy_match_key(play.get("title"))
+        if not artist or not title:
+            continue
+        if key in (title + artist, artist + title):
+            return play
+    return None

@@ -15,9 +15,11 @@ from music_assistant.providers.listening_habits.helpers import (
     QualityCache,
     device_type_from_model,
     guess_device_type_and_room,
+    match_play,
     named_show,
     on_air_station_slug,
     on_air_url,
+    station_playlist_url,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -230,3 +232,71 @@ def test_on_air_url(endpoint: str, expected: str) -> None:
 def test_named_show(show_name: str | None, expected: str | None) -> None:
     """A generic rotation label is not a show worth displaying."""
     assert named_show(show_name) == expected
+
+
+# Two plays as the log server returns them, shortened to the fields that matter
+# to matching. Real values: these are the strings the feed actually served on
+# 2026-08-28.
+PLAYS: list[dict[str, object]] = [
+    {
+        "artist": "Noah Kahan",
+        "title": "The Great Divide",
+        "album": "Cape Elizabeth",
+        "artwork_url": "https://albumart.publicradio.org/a.jpg",
+        "duration_s": 213,
+    },
+    {
+        "artist": "The Smashing Pumpkins",
+        "title": "Tonight, Tonight",
+        "album": "Mellon Collie and the Infinite Sadness",
+        "artwork_url": "https://albumart.publicradio.org/b.jpg",
+        "duration_s": 255,
+    },
+]
+
+
+@pytest.mark.parametrize(
+    ("icy_title", "expected_album"),
+    [
+        # The shape The Current actually sends: "Title-Artist", no spaces.
+        # Splitting on the hyphen is not possible -- "The Great Divide" and
+        # plenty of artist names carry their own.
+        ("The Great Divide-Noah Kahan", "Cape Elizabeth"),
+        # The feed writes "Tonight, Tonight"; the stream drops the comma.
+        # Neither spelling is wrong and the difference means nothing.
+        ("Tonight Tonight-The Smashing Pumpkins", "Mellon Collie and the Infinite Sadness"),
+        # Ordering is an observation about this station, not a promise.
+        ("Noah Kahan - The Great Divide", "Cape Elizabeth"),
+        # What the stream sends during a talk break. No song is playing, so
+        # matching nothing is the correct answer rather than a failure.
+        ("The Current-", None),
+        # A song the feed has not logged yet -- the stream runs ahead of it at
+        # the start of a play.
+        ("Some Song-Nobody", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_match_play(icy_title: str | None, expected_album: str | None) -> None:
+    """An ICY title is matched to a logged play by identity, not by splitting."""
+    match = match_play(icy_title, PLAYS)
+    assert (match["album"] if match else None) == expected_album
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        (
+            "https://host/api/ingest",
+            "https://host/api/station-playlist?station=the-current&limit=12",
+        ),
+        # A server mounted under a sub-path keeps it.
+        (
+            "https://host/lhs/api/ingest",
+            "https://host/lhs/api/station-playlist?station=the-current&limit=12",
+        ),
+    ],
+)
+def test_station_playlist_url(endpoint: str, expected: str) -> None:
+    """The playlist route is built as a sibling of the configured ingest URL."""
+    assert station_playlist_url(endpoint, "the-current") == expected

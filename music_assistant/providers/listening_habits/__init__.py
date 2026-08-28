@@ -29,7 +29,12 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import EventType, MediaType, ProviderFeature
+from music_assistant_models.streamdetails import StreamMetadata
 
+from music_assistant.controllers.streams.constants import (
+    STREAMDETAILS_INBAND_TITLE_HANDOFF_KEY,
+    STREAMDETAILS_INBAND_TITLE_KEY,
+)
 from music_assistant.helpers.scrobbler import ScrobblerConfig
 from music_assistant.models.plugin import PluginProvider
 
@@ -38,9 +43,11 @@ from .helpers import (
     QualityCache,
     device_type_from_model,
     guess_device_type_and_room,
+    match_play,
     named_show,
     on_air_station_slug,
     on_air_url,
+    station_playlist_url,
 )
 
 if TYPE_CHECKING:
@@ -50,6 +57,7 @@ if TYPE_CHECKING:
     from music_assistant_models.event import MassEvent
     from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
     from music_assistant_models.provider import ProviderManifest
+    from music_assistant_models.queue_item import QueueItem
     from music_assistant_models.streamdetails import StreamDetails
 
     from music_assistant.mass import MusicAssistant
@@ -73,6 +81,26 @@ PUSH_TIMEOUT_S = 15
 ON_AIR_MIN_CACHE_S = 60
 ON_AIR_MAX_CACHE_S = 600
 ON_AIR_TIMEOUT_S = 10
+
+# Generic ICY radio reaches Music Assistant as a single "StreamTitle" string
+# and nothing else -- no album, no artwork, no duration. The station's own
+# playlist feed has all three, and the log server already scrapes it, so this
+# provider claims stream_metadata for the stations it can enrich and fills it
+# from there. The ICY title is still what says *which* song: it is the only
+# source that is actually in the audio.
+#
+# How often the queue controller calls the callback. The work behind it is
+# skipped unless the in-band title changed, so this is the resolution at which
+# a song change is noticed, not a poll rate.
+STREAM_METADATA_INTERVAL_S = 5
+PLAYLIST_TIMEOUT_S = 10
+PLAYLIST_CACHE_S = 10
+
+# Keys this provider owns inside StreamDetails.data, namespaced because the
+# dict is shared with Music Assistant's own in-band title handoff.
+STATION_SLUG_KEY = "listening_habits_station"
+LAST_MATCHED_KEY = "listening_habits_matched_title"
+LAST_VERBATIM_KEY = "listening_habits_verbatim_title"
 
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
 
@@ -119,6 +147,10 @@ class ListeningHabitsProvider(PluginProvider):
         # slug -> (expires_at, payload). Payload may be None: "nothing is
         # scheduled right now" is a real answer and worth not re-asking for.
         self._on_air_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+        # slug -> (expires_at, plays). Short-lived: only read while an in-band
+        # title has no match yet, which is the window where the stream is ahead
+        # of the feed and the same question gets asked every few seconds.
+        self._playlist_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -189,6 +221,140 @@ class ListeningHabitsProvider(PluginProvider):
             return
         if item.media_item and item.streamdetails:
             self._quality.remember(item.media_item.uri, item.streamdetails)
+        self._claim_stream_metadata(item)
+
+    # ------------------------------------------------------------------
+    # stream metadata
+    # ------------------------------------------------------------------
+
+    def _claim_stream_metadata(self, item: QueueItem) -> None:
+        """
+        Offer to own stream_metadata for a station this provider can enrich.
+
+        Music Assistant lets the provider that serves a stream take over its
+        metadata (StreamDetails.stream_metadata_update_callback -- nts,
+        radioparadise and bbc_sounds all use it). Generic ICY stations have no
+        such provider, so nobody claims them and the browser gets a bare
+        "Title-Artist" string.
+
+        This is a plugin, not the provider that owns the item, so it claims the
+        slot only when it is empty. That guard is what keeps it from fighting
+        an owning provider, or Music Assistant's own HLS metadata handler,
+        which sets the same field.
+
+        Called on every queue update rather than once, because there is no
+        event for "streamdetails now exist" -- reclaiming an already-claimed
+        stream is a no-op by the same guard.
+        """
+        streamdetails = item.streamdetails
+        if streamdetails is None or streamdetails.media_type != MediaType.RADIO:
+            return
+        if streamdetails.stream_metadata_update_callback is not None:
+            return
+        if not self._endpoint or not self._token:
+            return
+        station = item.media_item.name if item.media_item else item.name
+        slug = on_air_station_slug(station)
+        if not slug:
+            return
+        data = streamdetails.data if streamdetails.data is not None else {}
+        # Tells the ICY reader to hand the in-band title over as data rather
+        # than writing stream_metadata itself. Without it both would write.
+        data[STREAMDETAILS_INBAND_TITLE_HANDOFF_KEY] = True
+        data[STATION_SLUG_KEY] = slug
+        streamdetails.data = data
+        streamdetails.stream_metadata_update_callback = self._update_stream_metadata
+        streamdetails.stream_metadata_update_interval = STREAM_METADATA_INTERVAL_S
+        self.logger.debug("Owning stream metadata for %s (%s)", station, slug)
+
+    async def _update_stream_metadata(
+        self, streamdetails: StreamDetails, elapsed_time: int
+    ) -> None:
+        """
+        Fill stream_metadata from the station's playlist feed.
+
+        The in-band ICY title says which song; the feed says everything else
+        about it. Matching the two beats reading the newest feed entry and
+        hoping: the feed logs a play when it airs and goes quiet during talk
+        breaks, so its newest entry is regularly minutes old and describes a
+        song that finished.
+
+        No match is the normal case twice over -- during a talk break there is
+        no song, and at the start of one the feed has not logged it yet. Both
+        show the ICY title verbatim, which is exactly what Music Assistant
+        would have shown anyway, and the second resolves itself on a later
+        call once the feed catches up.
+
+        :param streamdetails: StreamDetails to write metadata onto.
+        :param elapsed_time: Elapsed playback seconds (unused: a live stream's
+            position says nothing about where the current song started).
+        """
+        data = streamdetails.data if streamdetails.data is not None else {}
+        streamdetails.data = data
+        icy_title = (data.get(STREAMDETAILS_INBAND_TITLE_KEY) or "").strip()
+        slug = data.get(STATION_SLUG_KEY)
+        if not icy_title or not slug:
+            return
+        if data.get(LAST_MATCHED_KEY) == icy_title:
+            # Already resolved this song from the feed; nothing changes until
+            # the station sends a different title.
+            return
+        play = match_play(icy_title, await self._station_plays(str(slug)))
+        if play is None:
+            # Write it once, then keep asking: a title the feed has not logged
+            # yet is indistinguishable from a talk break until it appears.
+            if data.get(LAST_VERBATIM_KEY) != icy_title:
+                data[LAST_VERBATIM_KEY] = icy_title
+                streamdetails.stream_metadata = StreamMetadata(title=icy_title)
+            return
+        data.pop(LAST_VERBATIM_KEY, None)
+        data[LAST_MATCHED_KEY] = icy_title
+        duration = play.get("duration_s")
+        streamdetails.stream_metadata = StreamMetadata(
+            title=str(play.get("title") or icy_title),
+            artist=str(play["artist"]) if play.get("artist") else None,
+            album=str(play["album"]) if play.get("album") else None,
+            image_url=str(play["artwork_url"]) if play.get("artwork_url") else None,
+            duration=int(duration) if duration else None,
+        )
+        self.logger.debug(
+            "Stream metadata for %s: %s - %s", slug, play.get("artist"), play.get("title")
+        )
+
+    async def _station_plays(self, slug: str) -> list[dict[str, Any]]:
+        """
+        Recent plays for a station, briefly cached, or [] when unavailable.
+
+        A failed lookup returns the stale list rather than nothing: the feed
+        being unreachable for one call is no reason to forget a song that is
+        still playing.
+        """
+        now = datetime.now(UTC).timestamp()
+        cached = self._playlist_cache.get(slug)
+        if cached and cached[0] > now:
+            return cached[1]
+        if not self._endpoint or not self._token:
+            return cached[1] if cached else []
+        try:
+            async with self.mass.http_session.get(
+                station_playlist_url(self._endpoint, slug),
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=PLAYLIST_TIMEOUT_S,
+            ) as response:
+                if response.status >= 400:
+                    self.logger.debug("playlist lookup for %s returned %s", slug, response.status)
+                    return cached[1] if cached else []
+                payload = await response.json()
+        except Exception as err:
+            # Same posture as the on-air lookup: a missing album name harms
+            # nobody's listening, so this is debug-level and simply reuses
+            # whatever was last known.
+            self.logger.debug("playlist lookup for %s failed: %s", slug, err)
+            return cached[1] if cached else []
+        plays = payload.get("plays") if isinstance(payload, dict) else None
+        plays = plays if isinstance(plays, list) else []
+        self._playlist_cache[slug] = (now + PLAYLIST_CACHE_S, plays)
+        return plays
 
     def _should_log(self, report: MediaItemPlaybackProgressReport) -> bool:
         """
