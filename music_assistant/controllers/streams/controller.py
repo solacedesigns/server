@@ -167,6 +167,28 @@ def _audio_source_headers(session: AudioSourceSession, output_format_str: str) -
     }
 
 
+def _icy_image_url(current_item: QueueItem | None) -> str | None:
+    """
+    Best image for the item on air, preferring the track over the station.
+
+    For radio, current_item.image is the station logo and stays that way for
+    the whole session, so every song would share one picture. A provider that
+    fills stream_metadata knows what is actually playing right now, and that
+    is what a listener expects to see.
+    """
+    if current_item is None:
+        return None
+    if (
+        current_item.streamdetails
+        and (stream_metadata := current_item.streamdetails.stream_metadata)
+        and stream_metadata.image_url
+    ):
+        return stream_metadata.image_url
+    if current_item.image:
+        return current_item.image.path
+    return None
+
+
 async def _wav_passthrough_stream(
     audio_input: AsyncGenerator[bytes], output_format: AudioFormat
 ) -> AsyncGenerator[bytes]:
@@ -628,6 +650,48 @@ class StreamsController(CoreController):
             f"{self.base_url}/{base_path}/{session_id}/{queue_id}/{queue_item_id}/{player_id}.{fmt}"
         )
 
+    def _resolve_icy_settings(self, request: web.Request, player_id: str) -> tuple[bool, int, str]:
+        """
+        Work out whether this response should carry ICY metadata, and how.
+
+        Both conditions matter. A player that did not ask for ICY must get an
+        unmodified byte stream, because the metadata blocks are interleaved
+        into the audio and anything not expecting them decodes them as noise.
+
+        Returns (enabled, byte interval between metadata blocks, preference).
+        """
+        icy_preference = self.mass.config.get_raw_player_config_value(
+            player_id,
+            CONF_ENTRY_ENABLE_ICY_METADATA.key,
+            CONF_ENTRY_ENABLE_ICY_METADATA.default_value,
+        )
+        enable_icy = request.headers.get("Icy-MetaData", "") == "1" and icy_preference != "disabled"
+        icy_meta_interval = 256000 if icy_preference == "full" else 16384
+        return enable_icy, icy_meta_interval, icy_preference
+
+    @staticmethod
+    def _build_icy_metadata(current_item: QueueItem | None, include_image: bool) -> bytes:
+        """
+        Build one length-prefixed, padded ICY metadata block.
+
+        The caller is responsible for emitting this after exactly icy-metaint
+        bytes of audio; the block carries no offset of its own, so its position
+        in the stream is the only thing telling the player where it belongs.
+        """
+        if current_item and current_item.streamdetails and current_item.streamdetails.stream_title:
+            title = current_item.streamdetails.stream_title
+        elif current_item and current_item.name:
+            title = current_item.name
+        else:
+            title = "Music Assistant"
+        metadata = f"StreamTitle='{title}';".encode()
+        if include_image and (image_url := _icy_image_url(current_item)):
+            metadata += f"StreamURL='{image_url}'".encode()
+        while len(metadata) % 16 != 0:
+            metadata += b"\x00"
+        length_b = chr(int(len(metadata) / 16)).encode()
+        return length_b + metadata
+
     async def serve_queue_item_stream(self, request: web.Request) -> web.StreamResponse:  # noqa: PLR0915
         """Stream single queueitem audio to a player."""
         self._log_request(request)
@@ -791,6 +855,27 @@ class StreamsController(CoreController):
                 media_type=queue_item.media_type,
             )
 
+            # Radio never runs in flow mode (see resolve_stream_url), so this is
+            # the only path a station's stream ever takes -- and therefore the
+            # only place ICY metadata can reach the player that is playing it.
+            http_profile = player.get_config_value(CONF_HTTP_PROFILE, "default")
+            enable_icy, icy_meta_interval, icy_preference = self._resolve_icy_settings(
+                request, player_id
+            )
+            if enable_icy and http_profile == "forced_content_length" and queue_item.duration:
+                # Mutually exclusive: that profile announces an exact byte count
+                # derived from the audio alone, and the interleaved metadata
+                # would push the response past it -- aiohttp stops writing at the
+                # declared length, so the tail of the track would be cut off.
+                # Losing a title line beats losing the end of every song.
+                self.logger.warning(
+                    "ICY metadata disabled for %s: not compatible with the "
+                    "'forced content length' HTTP profile on player %s",
+                    queue_item.name,
+                    player.state.name,
+                )
+                enable_icy = False
+
             # prepare request, add some DLNA/UPNP compatible headers
             # icy-name is sanitized (all control chars, not just newlines) to avoid a
             # "Potential header injection attack" ValueError by aiohttp
@@ -804,14 +889,18 @@ class StreamsController(CoreController):
             )
             headers = {
                 **DEFAULT_STREAM_HEADERS,
+                # ICY_HEADERS is spread first on purpose: it carries a generic
+                # icy-name, and the station's own name below must win.
+                **(ICY_HEADERS if enable_icy else {}),
                 "icy-name": sanitize_http_header_value(queue_item.name),
                 "contentFeatures.dlna.org": dlna_features,
                 "Content-Type": get_mime_type(output_format.output_format_str),
             }
+            if enable_icy:
+                headers["icy-metaint"] = str(icy_meta_interval)
 
             resp = web.StreamResponse(status=200, reason="OK", headers=headers)
             resp.content_type = get_mime_type(output_format.output_format_str)
-            http_profile = player.get_config_value(CONF_HTTP_PROFILE, "default")
             if http_profile == "forced_content_length" and not queue_item.duration:
                 # just set an insane high content length to make sure the player keeps playing
                 resp.content_length = calculate_content_length(output_format, 12 * 3600)
@@ -893,6 +982,10 @@ class StreamsController(CoreController):
             audio_bytes: AsyncGenerator[bytes]
             if (
                 queue_item.media_type == MediaType.AUDIO_SOURCE
+                # the passthrough yields whatever sized chunks it reads, and ICY
+                # needs metadata written at an exact byte interval, so the two
+                # are mutually exclusive -- take the ffmpeg path when ICY is on
+                and not enable_icy
                 and output_format.content_type == ContentType.WAV
                 and not filter_params
                 and output_format.sample_rate == pcm_format.sample_rate
@@ -906,6 +999,9 @@ class StreamsController(CoreController):
                     input_format=pcm_format,
                     output_format=output_format,
                     filter_params=filter_params,
+                    # one chunk per metadata interval, so the write loop can
+                    # emit a block after every chunk and stay aligned
+                    chunk_size=icy_meta_interval if enable_icy else None,
                     extra_input_args=[
                         "-readrate",
                         SINGLE_ITEM_READRATE,
@@ -937,6 +1033,15 @@ class StreamsController(CoreController):
                         try:
                             await resp.write(chunk)
                             bytes_sent += len(chunk)
+                            if enable_icy:
+                                # deliberately not counted in bytes_sent: that
+                                # figure feeds the bytes-per-second cache used to
+                                # estimate content length, which is audio only
+                                await resp.write(
+                                    self._build_icy_metadata(
+                                        queue.current_item, icy_preference == "full"
+                                    )
+                                )
                             if not first_chunk_received:
                                 first_chunk_received = True
                                 # inform the queue that the track is now loaded in the buffer
@@ -1167,13 +1272,9 @@ class StreamsController(CoreController):
             media_type=start_queue_item.media_type,
         )
         # work out ICY metadata support
-        icy_preference = self.mass.config.get_raw_player_config_value(
-            player_id,
-            CONF_ENTRY_ENABLE_ICY_METADATA.key,
-            CONF_ENTRY_ENABLE_ICY_METADATA.default_value,
+        enable_icy, icy_meta_interval, icy_preference = self._resolve_icy_settings(
+            request, player_id
         )
-        enable_icy = request.headers.get("Icy-MetaData", "") == "1" and icy_preference != "disabled"
-        icy_meta_interval = 256000 if icy_preference == "full" else 16384
 
         # prepare request, add some DLNA/UPNP compatible headers.
         # icy-name (in DEFAULT_STREAM_HEADERS) is always present so players have a
@@ -1269,26 +1370,11 @@ class StreamsController(CoreController):
                         continue
 
                     # if icy metadata is enabled, send the icy metadata after the chunk
-                    if (
-                        # use current item here and not buffered item, otherwise
-                        # the icy metadata will be too much ahead
-                        (current_item := queue.current_item)
-                        and current_item.streamdetails
-                        and current_item.streamdetails.stream_title
-                    ):
-                        title = current_item.streamdetails.stream_title
-                    elif queue and current_item and current_item.name:
-                        title = current_item.name
-                    else:
-                        title = "Music Assistant"
-                    metadata = f"StreamTitle='{title}';".encode()
-                    if icy_preference == "full" and current_item and current_item.image:
-                        metadata += f"StreamURL='{current_item.image.path}'".encode()
-                    while len(metadata) % 16 != 0:
-                        metadata += b"\x00"
-                    length = len(metadata)
-                    length_b = chr(int(length / 16)).encode()
-                    await resp.write(length_b + metadata)
+                    # use current item here and not buffered item, otherwise
+                    # the icy metadata will be too much ahead
+                    await resp.write(
+                        self._build_icy_metadata(queue.current_item, icy_preference == "full")
+                    )
         finally:
             self._active_output_streams -= 1
 

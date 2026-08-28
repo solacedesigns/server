@@ -66,14 +66,14 @@
     },
     "enable_icy_metadata": {
       "label": "Try to inject metadata into stream (ICY)",
-      "description": "Try to inject metadata into the stream (ICY) to show track info on the player, even when flow mode is enabled.\n\nThis is called ICY metadata and is what is used by online radio stations to show you what is playing. \n\nBe aware that not all players support this correctly. If you experience issues with playback, try disabling this setting.",
+      "description": "Try to inject metadata into the stream (ICY) so the player itself can show track info, including for radio stations.\n\nThis is called ICY metadata and is what is used by online radio stations to show you what is playing. \n\nBe aware that not all players support this correctly. If you experience issues with playback, try disabling this setting.",
       "options": {
         "disabled": "Disabled - do not send ICY metadata",
         "basic": "Profile 1 - basic info",
         "full": "Profile 2 - full info (including image)"
       },
       "option_descriptions": {
-        "disabled": "Don't inject metadata; the player won't show track info during flow mode.",
+        "disabled": "Don't inject metadata; the player won't show track info of its own.",
         "basic": "Send title and artist only. Lightweight and widely compatible.",
         "full": "Also send album name and cover art. Richer, but some players mishandle it — use Basic if you see playback issues."
       }

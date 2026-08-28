@@ -689,8 +689,10 @@ CONF_ENTRY_ENABLE_ICY_METADATA = ConfigEntry(
         ConfigValueOption("basic"),
         ConfigValueOption("full"),
     ],
-    depends_on=CONF_FLOW_MODE,
-    depends_on_value_not=False,
+    # Deliberately not gated on flow mode. Radio is excluded from flow mode
+    # (see StreamsController.resolve_stream_url) yet is the single biggest
+    # reason to want ICY at all, so gating this on flow mode hid the setting
+    # from exactly the case it exists for.
     default_value="disabled",
     category="protocol_generic",
     advanced=True,
