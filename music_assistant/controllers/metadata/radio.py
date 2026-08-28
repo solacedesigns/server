@@ -8,6 +8,7 @@ metadata against the local library and MusicBrainz/online metadata providers.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from time import time
 from typing import TYPE_CHECKING, Any, cast
 
@@ -28,7 +29,6 @@ from music_assistant_models.media_items import (
     MediaItemMetadata,
     Track,
 )
-from music_assistant_models.streamdetails import StreamMetadata
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.helpers.compare import compare_strings
@@ -418,10 +418,15 @@ class RadioArtworkMixin:
                 or final_artist != original_artist
                 or final_title != original_title
             ):
-                streamdetails.stream_metadata = StreamMetadata(
+                # replace() rather than a fresh StreamMetadata: only the three
+                # fields looked up here were corrected, and rebuilding the object
+                # silently dropped every other one a provider had filled in --
+                # duration and elapsed_time among them, which is what the player
+                # progress bar is drawn from.
+                streamdetails.stream_metadata = replace(
+                    streamdetails.stream_metadata,
                     title=final_title,
                     artist=final_artist,
-                    album=album,
                     image_url=image_url,
                 )
                 streamdetails.stream_metadata_last_updated = time()
