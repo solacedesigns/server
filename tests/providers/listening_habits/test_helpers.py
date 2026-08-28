@@ -15,6 +15,9 @@ from music_assistant.providers.listening_habits.helpers import (
     QualityCache,
     device_type_from_model,
     guess_device_type_and_room,
+    named_show,
+    on_air_station_slug,
+    on_air_url,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -157,3 +160,73 @@ async def test_durable_queue_depth_tracks_appends_and_drains(tmp_path: Path) -> 
 
     await queue.drain(succeeds)
     assert await queue.depth() == 0
+
+
+@pytest.mark.parametrize(
+    ("station_name", "expected"),
+    [
+        ("The Current", "the-current"),
+        # A provider is free to decorate the name; the frequency and the
+        # punctuation must not decide whether the DJ shows up.
+        ("89.3 The Current", "the-current"),
+        ("thecurrent", "the-current"),
+        ("THE CURRENT", "the-current"),
+        ("The Current Morning Show", "the-current"),
+        ("KEXP", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_on_air_station_slug(station_name: str | None, expected: str | None) -> None:
+    """A station name a player reported resolves to a log-server slug."""
+    assert on_air_station_slug(station_name) == expected
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        (
+            "http://192.168.0.115:8130/api/ingest",
+            "http://192.168.0.115:8130/api/on-air?station=the-current",
+        ),
+        # Trailing slashes are a normal thing to paste into a config form.
+        (
+            "https://example.org/api/listens/",
+            "https://example.org/api/on-air?station=the-current",
+        ),
+        # The sub-path mount is the case that rules out just taking the
+        # origin: /lhs has to survive.
+        (
+            "https://example.org/lhs/api/ingest",
+            "https://example.org/lhs/api/on-air?station=the-current",
+        ),
+        # No /api/ segment at all -- treat the whole thing as the root
+        # rather than guessing which part of the path to discard.
+        (
+            "https://example.org/hooks/log",
+            "https://example.org/hooks/log/api/on-air?station=the-current",
+        ),
+    ],
+)
+def test_on_air_url(endpoint: str, expected: str) -> None:
+    """The on-air route is built as a sibling of the configured ingest URL."""
+    assert on_air_url(endpoint, "the-current") == expected
+
+
+@pytest.mark.parametrize(
+    ("show_name", "expected"),
+    [
+        ("Teenage Kicks", "Teenage Kicks"),
+        ("United States of Americana", "United States of Americana"),
+        # The station's ordinary rotation. Every hour that is not a specialty
+        # show carries this, and it is noise under the station's own name.
+        ("The Current Music", None),
+        ("the current music", None),
+        ("  The Current Music  ", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_named_show(show_name: str | None, expected: str | None) -> None:
+    """A generic rotation label is not a show worth displaying."""
+    assert named_show(show_name) == expected

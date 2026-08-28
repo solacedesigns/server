@@ -231,3 +231,72 @@ class DurableQueue:
         with open(tmp, "w", encoding="utf-8") as handle:
             handle.writelines(json.dumps(entry) + "\n" for entry in entries)
         os.replace(tmp, self.path)  # noqa: PTH105
+
+
+# Stations the log server can answer an on-air question for, keyed by a loose
+# form of the station name a player reports. MA names a radio item whatever
+# its source provider calls it -- TuneIn says "The Current", another provider
+# might say "89.3 The Current" -- so the match is on containment of a
+# normalised key rather than equality.
+#
+# Deliberately a table with one row. The log server 404s any station it has no
+# source for, so adding one here without adding it there just moves the "no"
+# one hop later; making the mapping explicit keeps both ends honest about how
+# few stations this actually covers.
+ON_AIR_STATIONS: dict[str, str] = {
+    "thecurrent": "the-current",
+}
+
+
+def on_air_station_slug(station_name: str | None) -> str | None:
+    """
+    Log-server station slug for a station name a player reported, or None.
+
+    Case, spacing and punctuation are ignored, so "The Current",
+    "the current" and "89.3 The Current" all resolve alike.
+    """
+    if not station_name:
+        return None
+    key = re.sub(r"[^a-z0-9]+", "", station_name.lower())
+    for needle, slug in ON_AIR_STATIONS.items():
+        if needle in key:
+            return slug
+    return None
+
+
+def on_air_url(ingest_endpoint: str, slug: str) -> str:
+    """
+    Build the on-air URL that sits alongside a configured ingest endpoint.
+
+    The endpoint is configured as a full ingest URL ("https://host/api/ingest"),
+    and the on-air route is its sibling. Cutting at the last "/api/" rather
+    than replacing the whole path keeps a server mounted under a sub-path
+    ("https://host/lhs/api/ingest") working, which reaching for the bare origin
+    would break.
+    """
+    marker = "/api/"
+    base = ingest_endpoint.rstrip("/")
+    cut = base.rfind(marker)
+    root = base[:cut] if cut != -1 else base
+    return f"{root}/api/on-air?station={slug}"
+
+
+# Show names that mean "the station is just on", rather than a programme worth
+# naming. The Current labels every hour of its ordinary rotation "The Current
+# Music", which says nothing the station name and the DJ do not already say.
+#
+# This mirrors GENERIC_SHOWS in the log server's ingest/thecurrent-schedule.mjs.
+# It is duplicated rather than asked for because the server's /api/on-air route
+# returns the block's raw showName, while its own row-enrichment path filters
+# it through namedShow() -- so the two disagree today, and only the enrichment
+# side is right. The better fix is one line there; until then, do not let a
+# Now Playing screen read "The Current Music" under "The Current".
+GENERIC_SHOWS = frozenset({"the current music"})
+
+
+def named_show(show_name: str | None) -> str | None:
+    """Return the show worth displaying, or None for a station's ordinary rotation."""
+    show = str(show_name or "").strip()
+    if not show or show.lower() in GENERIC_SHOWS:
+        return None
+    return show

@@ -38,6 +38,9 @@ from .helpers import (
     QualityCache,
     device_type_from_model,
     guess_device_type_and_room,
+    named_show,
+    on_air_station_slug,
+    on_air_url,
 )
 
 if TYPE_CHECKING:
@@ -60,6 +63,16 @@ CONF_HOME_PLACE = "home_place_name"
 # built up overnight still drains even if nothing plays for a while.
 RETRY_INTERVAL_S = 300
 PUSH_TIMEOUT_S = 15
+
+# The on-air lookup is a scrape of the station's schedule page two hops away,
+# so it is cached rather than made once per asking client. A block's own
+# ends_at bounds the cache; these are the floor and ceiling around it. The
+# floor stops a block that is about to end from being re-fetched on every
+# poll; the ceiling keeps a long block (an overnight rotation is hours) from
+# going stale if the schedule is changed mid-flight.
+ON_AIR_MIN_CACHE_S = 60
+ON_AIR_MAX_CACHE_S = 600
+ON_AIR_TIMEOUT_S = 10
 
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
 
@@ -97,11 +110,15 @@ class ListeningHabitsProvider(PluginProvider):
         # nothing to say about pushes it did not make. The backlog on disk is
         # the part that must survive, and it does.
         self._unregister_api: Callable[[], None] | None = None
+        self._unregister_on_air: Callable[[], None] | None = None
         self._logged_total = 0
         self._failed_total = 0
         self._last_result: str | None = None
         self._last_error: str | None = None
         self._last_logged: dict[str, Any] | None = None
+        # slug -> (expires_at, payload). Payload may be None: "nothing is
+        # scheduled right now" is a real answer and worth not re-asking for.
+        self._on_air_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -136,6 +153,9 @@ class ListeningHabitsProvider(PluginProvider):
         self._unregister_api = self.mass.register_api_command(
             "listening_habits/status", self.get_status
         )
+        self._unregister_on_air = self.mass.register_api_command(
+            "listening_habits/on_air", self.get_on_air
+        )
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unsubscribe and stop the retry loop."""
@@ -145,6 +165,9 @@ class ListeningHabitsProvider(PluginProvider):
         if self._unregister_api is not None:
             self._unregister_api()
             self._unregister_api = None
+        if self._unregister_on_air is not None:
+            self._unregister_on_air()
+            self._unregister_on_air = None
         if self._retry_task and not self._retry_task.done():
             self._retry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -454,4 +477,86 @@ class ListeningHabitsProvider(PluginProvider):
             "last_result": self._last_result,
             "last_error": self._last_error,
             "last_logged": self._last_logged,
+        }
+
+    async def get_on_air(self, station: str | None = None) -> dict[str, Any] | None:
+        """
+        Report who is presenting on a live station right now, or None.
+
+        Exists because MA has nowhere to get this. A station's show and DJ are
+        not in the stream: ICY metadata carries the song and nothing else, and
+        StreamMetadata.description -- the field built for exactly this -- is
+        populated by only a couple of providers, none of which serve this
+        station. The log server already scrapes the station's schedule page to
+        attribute logged plays, so this asks it rather than growing a second
+        scraper here that could disagree with the first.
+
+        `station` is the station name as the player reports it, not a slug;
+        resolving it is this provider's job, not the caller's.
+        """
+        slug = on_air_station_slug(station)
+        if not slug or not self._endpoint or not self._token:
+            return None
+        now = datetime.now(UTC).timestamp()
+        if (cached := self._on_air_cache.get(slug)) and cached[0] > now:
+            return cached[1]
+        try:
+            async with self.mass.http_session.get(
+                on_air_url(self._endpoint, slug),
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=ON_AIR_TIMEOUT_S,
+            ) as response:
+                if response.status >= 400:
+                    self.logger.debug("on-air lookup for %s returned %s", slug, response.status)
+                    return None
+                block = self._as_on_air(await response.json())
+        except Exception as err:
+            # Nobody's listening is harmed by not knowing who the DJ is, so a
+            # failure here is debug-level and simply uncached: the next poll
+            # gets a fresh try rather than inheriting a shrugged-off answer.
+            self.logger.debug("on-air lookup for %s failed: %s", slug, err)
+            return None
+        self._on_air_cache[slug] = (now + self._on_air_ttl(block, now), block)
+        return block
+
+    @staticmethod
+    def _on_air_ttl(block: dict[str, Any] | None, now: float) -> float:
+        """
+        How long an on-air answer stays good for, from the block's own end time.
+
+        A block knows when it is over, which beats any fixed interval: an hour
+        into a three-hour show there is provably nothing to re-ask, and thirty
+        seconds before the handover there provably is.
+        """
+        ends_at = (block or {}).get("ends_at")
+        if not ends_at:
+            return ON_AIR_MIN_CACHE_S
+        try:
+            remaining = datetime.fromisoformat(str(ends_at)).timestamp() - now
+        except ValueError:
+            return ON_AIR_MIN_CACHE_S
+        return min(max(remaining, ON_AIR_MIN_CACHE_S), ON_AIR_MAX_CACHE_S)
+
+    @staticmethod
+    def _as_on_air(block: Any) -> dict[str, Any] | None:
+        """
+        Reshape a log-server on-air block for display, or None if it says nothing.
+
+        A block with neither a host nor a nameable show is indistinguishable
+        from no answer at all, so it is reported as none rather than as an
+        object of nulls the caller then has to test field by field.
+        """
+        if not isinstance(block, dict):
+            return None
+        show = named_show(block.get("show_name"))
+        host = str(block.get("host_name") or "").strip() or None
+        if not show and not host:
+            return None
+        return {
+            "station": block.get("station"),
+            "show_name": show,
+            "host_name": host,
+            "hosts": block.get("hosts") or [],
+            "starts_at": block.get("starts_at"),
+            "ends_at": block.get("ends_at"),
         }
