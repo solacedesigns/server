@@ -186,6 +186,24 @@ class DurableQueue:
                 )
             return delivered
 
+    async def depth(self) -> int:
+        """
+        How many plays are waiting to be delivered.
+
+        Counts lines rather than parsing them: this is called to render a
+        status indicator, so a torn final line should not make the whole
+        answer fail. It deliberately does NOT take the lock -- a status read
+        must never wait behind an in-flight drain, and being one play stale
+        matters less than blocking the UI.
+        """
+        return await asyncio.to_thread(self._depth_sync)
+
+    def _depth_sync(self) -> int:
+        if not os.path.exists(self.path):  # noqa: PTH110
+            return 0
+        with open(self.path, encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+
     def _read_sync(self) -> list[dict[str, Any]]:
         if not os.path.exists(self.path):  # noqa: PTH110
             return []

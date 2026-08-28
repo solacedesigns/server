@@ -92,6 +92,16 @@ class ListeningHabitsProvider(PluginProvider):
         self._retry_task: asyncio.Task[None] | None = None
         # player_id -> uri of the last play counted for it; see _should_log.
         self._last_counted: dict[str, str] = {}
+        # What the Now Playing indicator reports. Held in memory only: it
+        # describes this run of the provider, and a restart genuinely has
+        # nothing to say about pushes it did not make. The backlog on disk is
+        # the part that must survive, and it does.
+        self._unregister_api: Callable[[], None] | None = None
+        self._logged_total = 0
+        self._failed_total = 0
+        self._last_result: str | None = None
+        self._last_error: str | None = None
+        self._last_logged: dict[str, Any] | None = None
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -121,12 +131,20 @@ class ListeningHabitsProvider(PluginProvider):
             self.mass.subscribe(self._on_media_item_played, EventType.MEDIA_ITEM_PLAYED)
         )
         self._retry_task = self.mass.create_task(self._retry_loop())
+        # required_scope=None -> any authenticated user. This only reads back
+        # what we already logged, and the frontend calls it to render a chip.
+        self._unregister_api = self.mass.register_api_command(
+            "listening_habits/status", self.get_status
+        )
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unsubscribe and stop the retry loop."""
         for unsub in self._on_unload:
             unsub()
         self._on_unload.clear()
+        if self._unregister_api is not None:
+            self._unregister_api()
+            self._unregister_api = None
         if self._retry_task and not self._retry_task.done():
             self._retry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -360,6 +378,12 @@ class ListeningHabitsProvider(PluginProvider):
             ) as response:
                 if response.status < 300:
                     self.logger.debug("logged %s - %s", payload.get("artist"), payload.get("title"))
+                    self._note_result("ok")
+                    self._last_logged = {
+                        "artist": payload.get("artist"),
+                        "title": payload.get("title"),
+                        "at": datetime.now(UTC).timestamp(),
+                    }
                     return True
                 # An auth failure is a *configuration* error, not a bad
                 # payload: the play is perfectly good and will be accepted as
@@ -372,6 +396,7 @@ class ListeningHabitsProvider(PluginProvider):
                         "matches LHS_TOKEN on the log server",
                         response.status,
                     )
+                    self._note_result("refused", f"token rejected ({response.status})")
                     return False
                 # Any other 4xx is the server refusing this payload, not a
                 # transport problem -- retrying it forever would wedge the
@@ -383,8 +408,50 @@ class ListeningHabitsProvider(PluginProvider):
                         (await response.text())[:200],
                         payload.get("client_ref"),
                     )
+                    self._note_result("rejected", f"server rejected the play ({response.status})")
                     return True
                 self.logger.warning("push failed with status %s, queued", response.status)
+                self._note_result("error", f"HTTP {response.status}")
         except Exception as err:
             self.logger.warning("push failed (%s), queued", err)
+            self._note_result("error", str(err))
         return False
+
+    def _note_result(self, result: str, error: str | None = None) -> None:
+        """
+        Remember how the last push went, for the Now Playing indicator.
+
+        "rejected" counts as a failure here even though _push returns True for
+        it. True there means "stop retrying this payload", which is a backlog
+        decision; from the listener's point of view the play was still lost,
+        and an indicator that called that success would be lying.
+        """
+        self._last_result = result
+        self._last_error = error
+        if result == "ok":
+            self._logged_total += 1
+        else:
+            self._failed_total += 1
+
+    async def get_status(self) -> dict[str, Any]:
+        """
+        Report ingest health, for the frontend's Now Playing indicator.
+
+        Deliberately says nothing about the *current* track. The provider logs
+        on completion, so mid-play there is nothing yet to report about it --
+        what a listener can actually use here is whether the pipe is open and
+        whether anything is stuck behind it.
+
+        Never returns the token, only whether one is set.
+        """
+        return {
+            "configured": bool(self._endpoint and self._token),
+            "endpoint": self._endpoint or None,
+            "healthy": self._last_result in (None, "ok"),
+            "backlog": await self._backlog.depth(),
+            "logged_total": self._logged_total,
+            "failed_total": self._failed_total,
+            "last_result": self._last_result,
+            "last_error": self._last_error,
+            "last_logged": self._last_logged,
+        }

@@ -120,3 +120,40 @@ def test_device_type_from_model(
 ) -> None:
     """Hardware reported by the provider is preferred over parsing the name."""
     assert device_type_from_model(manufacturer, model) == expected
+
+
+async def test_durable_queue_depth_counts_without_parsing(tmp_path: Path) -> None:
+    """
+    Depth is a count, so a torn line still contributes to it.
+
+    _read_sync drops an unparseable line because it cannot be delivered.
+    depth() must not: the status indicator is there to say "something is
+    stuck", and a corrupt row is exactly that. Reporting 1 while the file
+    holds 2 lines would hide the problem the indicator exists to show.
+    """
+    path = str(tmp_path / "queue.jsonl")
+    queue = DurableQueue(path, _LOGGER)
+
+    assert await queue.depth() == 0  # no file yet
+
+    torn = json.dumps({"client_ref": "ma:1"}) + "\n" + '{"client_ref": "ma:2"'
+    await asyncio.to_thread(Path(path).write_text, torn, encoding="utf-8")
+
+    assert await queue.depth() == 2
+    assert len(queue._read_sync()) == 1
+
+
+async def test_durable_queue_depth_tracks_appends_and_drains(tmp_path: Path) -> None:
+    """Depth follows the backlog up and back down to nothing."""
+    path = str(tmp_path / "queue.jsonl")
+    queue = DurableQueue(path, _LOGGER)
+
+    await queue.append({"client_ref": "ma:1"})
+    await queue.append({"client_ref": "ma:2"})
+    assert await queue.depth() == 2
+
+    async def succeeds(_: dict[str, object]) -> bool:
+        return True
+
+    await queue.drain(succeeds)
+    assert await queue.depth() == 0
