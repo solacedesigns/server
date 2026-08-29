@@ -1,13 +1,18 @@
 """Tests for the RadioArtworkMixin name-matching helpers on MetaDataController."""
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
-from music_assistant_models.enums import ImageType
+from music_assistant_models.enums import ImageType, MediaType
 from music_assistant_models.media_items import (
     Artist,
+    AudioFormat,
     ItemMapping,
     MediaItemImage,
     MediaItemMetadata,
 )
+from music_assistant_models.streamdetails import StreamDetails, StreamMetadata
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.controllers.metadata import MetaDataController
@@ -140,3 +145,84 @@ class TestPrioritizeReleaseGroups:
         groups = [_release_group("First"), _release_group("Second")]
         result = MetaDataController._prioritize_release_groups(groups, "!!!")
         assert result is groups
+
+
+class TestUpdateRadioStreamArtwork:
+    """A station's own now-playing artwork outranks the artist/track name lookup."""
+
+    FEED_ART = "https://albumart.publicradio.org/mb/6a/6a3bd40d_e855.jpg"
+    LOOKUP_ART = "https://coverartarchive.example/some-other-release.jpg"
+
+    @staticmethod
+    def _streamdetails(image_url: str | None) -> StreamDetails:
+        """Radio streamdetails carrying a resolved now-playing song."""
+        return StreamDetails(
+            provider="test",
+            item_id="station",
+            audio_format=AudioFormat(),
+            media_type=MediaType.RADIO,
+            stream_metadata=StreamMetadata(
+                title="Congo Square",
+                artist="Sonny Landreth",
+                album="South of I-10",
+                image_url=image_url,
+            ),
+        )
+
+    @staticmethod
+    def _controller(
+        found: str | None,
+        corrected_artist: str | None = None,
+        corrected_track: str | None = None,
+    ) -> MetaDataController:
+        """Build a controller whose name lookup returns a fixed result."""
+        ctrl = _controller()
+        ctrl.mass = SimpleNamespace(
+            config=SimpleNamespace(get_raw_core_config_value=MagicMock(return_value=True)),
+            player_queues=SimpleNamespace(signal_update=MagicMock()),
+        )
+
+        async def _lookup(**kwargs: str | None) -> tuple[str | None, str | None, str | None]:
+            # Called by keyword only; mirrors the real helper's "or fallback" tail.
+            return found or kwargs["fallback_image_url"], corrected_artist, corrected_track
+
+        ctrl.get_image_url_by_name = _lookup
+        return ctrl
+
+    async def test_feed_artwork_survives_a_lookup_hit(self) -> None:
+        """The lookup finding a different cover must not displace the feed's."""
+        streamdetails = self._streamdetails(self.FEED_ART)
+        await self._controller(self.LOOKUP_ART).update_radio_stream_artwork(streamdetails)
+        assert streamdetails.stream_metadata.image_url == self.FEED_ART
+
+    async def test_feed_artwork_survives_a_lookup_miss(self) -> None:
+        """A lookup that finds nothing leaves the feed's artwork alone."""
+        streamdetails = self._streamdetails(self.FEED_ART)
+        await self._controller(None).update_radio_stream_artwork(streamdetails)
+        assert streamdetails.stream_metadata.image_url == self.FEED_ART
+
+    async def test_lookup_fills_the_gap_when_the_feed_gave_no_artwork(self) -> None:
+        """Stations without a now-playing image still get the looked-up cover."""
+        streamdetails = self._streamdetails(None)
+        await self._controller(self.LOOKUP_ART).update_radio_stream_artwork(streamdetails)
+        assert streamdetails.stream_metadata.image_url == self.LOOKUP_ART
+
+    async def test_name_correction_still_applies_alongside_feed_artwork(self) -> None:
+        """Swapped "Track - Artist" metadata is corrected without touching artwork."""
+        streamdetails = self._streamdetails(self.FEED_ART)
+        ctrl = self._controller(
+            self.LOOKUP_ART, corrected_artist="Sonny Landreth", corrected_track="Congo Square"
+        )
+        streamdetails.stream_metadata.artist = "Congo Square"
+        streamdetails.stream_metadata.title = "Sonny Landreth"
+        await ctrl.update_radio_stream_artwork(streamdetails)
+        assert streamdetails.stream_metadata.artist == "Sonny Landreth"
+        assert streamdetails.stream_metadata.title == "Congo Square"
+        assert streamdetails.stream_metadata.image_url == self.FEED_ART
+
+    async def test_station_logo_metadata_never_reaches_the_lookup(self) -> None:
+        """Providers set a station image with no artist; that must early-return."""
+        streamdetails = self._streamdetails("https://example/station-logo.png")
+        streamdetails.stream_metadata.artist = None
+        await self._controller(self.LOOKUP_ART).update_radio_stream_artwork(streamdetails)
+        assert streamdetails.stream_metadata.image_url == "https://example/station-logo.png"
