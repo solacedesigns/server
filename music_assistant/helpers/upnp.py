@@ -184,10 +184,30 @@ def create_didl_metadata(media: PlayerMedia, url: str | None = None) -> str:
         # flow stream, radio or other duration-less stream
         # Use streaming-optimized DLNA flags to prevent buffering
         title = media.title or uri
+        # AVTransport has no metadata-update action, so a renderer displays
+        # whatever DIDL it was handed at SetAVTransportURI time -- forever.
+        # Anything omitted here shows as "unknown" on the device for the whole
+        # stream, which is what this branch used to do to artist and album.
+        # Emitted only when populated: an empty element renders as a blank row
+        # rather than letting the device fall back to its own placeholder.
+        # Verified on a WiiM Ultra (Linkplay.5.2.824844) 2026-08-28 -- the
+        # device renders these under the existing audioBroadcast class, so the
+        # class and the DLNA flags are deliberately left alone.
+        artist_meta = (
+            f"<dc:creator>{escape_metadata(media.artist)}</dc:creator>"
+            f"<upnp:artist>{escape_metadata(media.artist)}</upnp:artist>"
+            if media.artist
+            else ""
+        )
+        album_meta = (
+            f"<upnp:album>{escape_metadata(media.album)}</upnp:album>" if media.album else ""
+        )
         return (
             '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">'
             f'<item id="flowmode" parentID="0" restricted="1">'
             f"<dc:title>{escape_metadata(title)}</dc:title>"
+            f"{artist_meta}"
+            f"{album_meta}"
             f"<upnp:albumArtURI>{escape_metadata(image_url)}</upnp:albumArtURI>"
             f"<dc:queueItemId>{escape_metadata(uri)}</dc:queueItemId>"
             f"<dc:description>Music Assistant</dc:description>"
