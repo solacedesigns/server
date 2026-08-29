@@ -25,7 +25,12 @@ from music_assistant_models.enums import (
     ProviderType,
 )
 from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
-from music_assistant_models.media_items import BrowseFolder
+from music_assistant_models.media_items import (
+    BrowseFolder,
+    ItemMapping,
+    Track,
+    UniqueList,
+)
 
 from music_assistant.constants import (
     CONF_LANGUAGE,
@@ -82,13 +87,18 @@ if TYPE_CHECKING:
         MediaItemType,
         Playlist,
         Podcast,
-        Track,
     )
 
     from music_assistant import MusicAssistant
     from music_assistant.controllers.music.media.base import MediaControllerBase
     from music_assistant.helpers.json import SerializableType
     from music_assistant.models.metadata_provider import MetadataProvider
+
+
+# Provider name on the stand-in Track built by get_lyrics_by_name. It deliberately
+# matches no loaded provider, so the lookup skips the "ask the item's own provider"
+# step and falls straight through to the metadata providers.
+LYRICS_LOOKUP_PROVIDER = "lyrics_lookup"
 
 
 class MetaDataController(
@@ -336,6 +346,62 @@ class MetaDataController(
         # on-demand lookups are not stored in the library db, so normalize on the way out
         # promoting LRC formatted text stored in the plain lyrics tag
         return lyrics, normalize_lrc_lyrics(lrc_lyrics or extract_lrc_lyrics(lyrics))
+
+    @api_command("metadata/get_lyrics_by_name", required_scope=Scope.LIBRARY_READ)
+    async def get_lyrics_by_name(
+        self,
+        title: str,
+        artist: str,
+        album: str | None = None,
+        duration: int | None = None,
+    ) -> tuple[str | None, str | None]:
+        """
+        Get lyrics for a track named by a live stream, which has no media item to look up.
+
+        A station's now-playing feed gives us text and nothing else -- there is no provider
+        item to fetch and nothing in the library to match. The lyrics providers only ever
+        read name, artist, album and duration off the Track they are handed, so a stand-in
+        carrying those four fields searches exactly as well as a real one.
+
+        :param title: Track title as reported by the stream.
+        :param artist: Track artist as reported by the stream.
+        :param album: Album name, optional. Providers narrow the search with it when given,
+            so a station feed naming a release differently than the lyrics database costs
+            matches that title and artist alone would have found. Omit when unsure.
+        :param duration: Track length in seconds, optional. LRCLIB refuses to look up a
+            track without one, so pass it whenever the feed supplies it.
+
+        Returns a tuple of (lyrics, lrc_lyrics) if found.
+        """
+        track = Track(
+            item_id=f"{artist} - {title}",
+            provider=LYRICS_LOOKUP_PROVIDER,
+            name=title,
+            duration=duration or 0,
+            # nothing streams or resolves this stand-in; it exists to be read from
+            provider_mappings=set(),
+            artists=UniqueList(
+                [
+                    ItemMapping(
+                        media_type=MediaType.ARTIST,
+                        item_id=artist,
+                        provider=LYRICS_LOOKUP_PROVIDER,
+                        name=artist,
+                    )
+                ]
+            ),
+            album=(
+                ItemMapping(
+                    media_type=MediaType.ALBUM,
+                    item_id=album,
+                    provider=LYRICS_LOOKUP_PROVIDER,
+                    name=album,
+                )
+                if album
+                else None
+            ),
+        )
+        return await self.get_track_lyrics(track)
 
     async def get_diagnostics(self) -> dict[str, SerializableType] | None:
         """Return diagnostics info for this controller to include in diagnostics reports."""
