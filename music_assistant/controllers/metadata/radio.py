@@ -413,8 +413,15 @@ class RadioArtworkMixin:
             # Use corrected artist/track if metadata was swapped
             final_artist = corrected_artist or original_artist
             final_title = corrected_track or original_title
+            # A provider only fills stream_metadata.image_url from a station's
+            # own now-playing feed, which names the exact release being played.
+            # The lookup above matches on artist and track name alone, so it can
+            # land on a different edition or a compilation -- a plausible cover
+            # for the right song, but not the one on air. Prefer what the feed
+            # said and let the lookup fill the gap when it said nothing.
+            final_image_url = fallback_url or image_url
             if (
-                image_url != fallback_url
+                final_image_url != fallback_url
                 or final_artist != original_artist
                 or final_title != original_title
             ):
@@ -427,7 +434,7 @@ class RadioArtworkMixin:
                     streamdetails.stream_metadata,
                     title=final_title,
                     artist=final_artist,
-                    image_url=image_url,
+                    image_url=final_image_url,
                 )
                 streamdetails.stream_metadata_last_updated = time()
                 if streamdetails.queue_id:
