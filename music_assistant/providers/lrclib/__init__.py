@@ -15,6 +15,7 @@ from music_assistant_models.enums import ConfigEntryType, ProviderFeature
 from music_assistant_models.errors import ResourceTemporarilyUnavailable
 from music_assistant_models.media_items import MediaItemMetadata, Track
 
+from music_assistant.constants import LYRICS_LOOKUP_PROVIDER
 from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
 from music_assistant.models.metadata_provider import MetadataProvider
@@ -89,7 +90,7 @@ class LrclibProvider(MetadataProvider):
 
         duration = track.duration or 0
 
-        if not duration:
+        if not duration and track.provider != LYRICS_LOOKUP_PROVIDER:
             self.logger.info("Skipping lyrics lookup for %s: No duration information", track.name)
             return None
 
@@ -100,16 +101,35 @@ class LrclibProvider(MetadataProvider):
             album_name,
         )
 
-        search_params = {
+        search_params: dict[str, Any] = {
             "track_name": track.name,
             "artist_name": artist_name,
             "album_name": album_name,
-            "duration": duration,
         }
+
+        if duration:
+            search_params["duration"] = duration
 
         self.logger.debug("Searching lyrics (sync-ed preferred) with params: %s", search_params)
 
-        if data := await self._get_data(**search_params):
+        data = await self._get_data(**search_params)
+
+        if not data and duration and track.provider == LYRICS_LOOKUP_PROVIDER:
+            # A live stream's duration comes from the station's schedule rather than
+            # the recording, and LRCLIB only accepts a match within 2 seconds. Measured
+            # over a radio station's log, that filter alone rejects one song in five
+            # that LRCLIB does have, sometimes over a minute out. The artist and title
+            # a station reports are reliable, so ask again on those alone.
+            self.logger.debug(
+                "No lyrics for %s by %s at %s seconds; retrying without the duration",
+                track.name,
+                artist_name,
+                duration,
+            )
+            del search_params["duration"]
+            data = await self._get_data(**search_params)
+
+        if data:
             synced_lyrics = data.get("syncedLyrics")
 
             if synced_lyrics:

@@ -38,6 +38,7 @@ from music_assistant.constants import (
     DB_TABLE_ALBUMS,
     DB_TABLE_ARTISTS,
     DB_TABLE_PLAYLISTS,
+    LYRICS_LOOKUP_PROVIDER,
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.controllers.tasks.context import (
@@ -93,12 +94,6 @@ if TYPE_CHECKING:
     from music_assistant.controllers.music.media.base import MediaControllerBase
     from music_assistant.helpers.json import SerializableType
     from music_assistant.models.metadata_provider import MetadataProvider
-
-
-# Provider name on the stand-in Track built by get_lyrics_by_name. It deliberately
-# matches no loaded provider, so the lookup skips the "ask the item's own provider"
-# step and falls straight through to the metadata providers.
-LYRICS_LOOKUP_PROVIDER = "lyrics_lookup"
 
 
 class MetaDataController(
@@ -368,8 +363,10 @@ class MetaDataController(
         :param album: Album name, optional. Providers narrow the search with it when given,
             so a station feed naming a release differently than the lyrics database costs
             matches that title and artist alone would have found. Omit when unsure.
-        :param duration: Track length in seconds, optional. LRCLIB refuses to look up a
-            track without one, so pass it whenever the feed supplies it.
+        :param duration: Track length in seconds, optional. Providers use it to pick between
+            releases of the same song, so pass it whenever the feed supplies it, but a
+            station's schedule is not a stopwatch -- a lookup that finds nothing on the
+            reported length is retried without it.
 
         Returns a tuple of (lyrics, lrc_lyrics) if found.
         """

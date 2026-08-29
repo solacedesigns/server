@@ -8,8 +8,8 @@ import pytest
 from music_assistant_models.enums import ProviderFeature, ProviderType
 from music_assistant_models.media_items import MediaItemMetadata, Track
 
+from music_assistant.constants import LYRICS_LOOKUP_PROVIDER
 from music_assistant.controllers.metadata import MetaDataController
-from music_assistant.controllers.metadata.controller import LYRICS_LOOKUP_PROVIDER
 
 
 def _controller() -> MetaDataController:

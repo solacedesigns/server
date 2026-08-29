@@ -66,6 +66,12 @@ HOMEASSISTANT_SYSTEM_USER: Final[str] = "homeassistant_system"
 # Port used by the internal ingress webserver for the HA integration
 INGRESS_SERVER_PORT: Final[int] = 8094
 
+# Provider name on the stand-in Track built by metadata/get_lyrics_by_name for a
+# track that a live stream named but that exists nowhere else. It deliberately
+# matches no loaded provider. Lyrics providers can test for it to tell a name off
+# a station's now-playing feed from a real, tagged library item.
+LYRICS_LOOKUP_PROVIDER: Final[str] = "lyrics_lookup"
+
 UNKNOWN_ARTIST: Final[str] = "[unknown]"
 UNKNOWN_ARTIST_ID_MBID: Final[str] = "125ec42a-7229-4250-afc5-e057484327fe"
 VARIOUS_ARTISTS_NAME: Final[str] = "Various Artists"
