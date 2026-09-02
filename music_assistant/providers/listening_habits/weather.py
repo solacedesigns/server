@@ -26,6 +26,14 @@ SYMBOLS = {
     "windy-variant": "wind",
 }
 
+CONDITION_LABELS = {
+    "clear-night": "Clear night",
+    "partlycloudy": "Partly cloudy",
+    "lightning-rainy": "Lightning and rain",
+    "snowy-rainy": "Snow and rain",
+    "windy-variant": "Windy",
+}
+
 
 def snapshot_from_hass_state(state: dict[str, Any]) -> dict[str, Any] | None:
     """Translate a Home Assistant weather state to the shared ingest schema."""
@@ -44,7 +52,11 @@ def snapshot_from_hass_state(state: dict[str, Any]) -> dict[str, Any] | None:
     if apparent is not None:
         apparent = _temperature_c(apparent, str(attributes.get("temperature_unit") or "°C"))
     condition_key = str(state.get("state") or "").strip().lower()
-    condition = condition_key.replace("-", " ").capitalize() or None
+    condition = (
+        CONDITION_LABELS.get(condition_key)
+        or condition_key.replace("-", " ").capitalize()
+        or None
+    )
     precipitation = (
         condition if any(term in condition_key for term in PRECIPITATION_TERMS) else None
     )

@@ -48,8 +48,8 @@ def test_hass_weather_state_maps_to_ingest_schema_and_converts_units() -> None:
         "weather_observed_at": 1788350400,
         "weather_temperature_c": 20.0,
         "weather_apparent_temperature_c": 19.0,
-        "weather_condition": "Lightning rainy",
-        "weather_precipitation": "Lightning rainy",
+        "weather_condition": "Lightning and rain",
+        "weather_precipitation": "Lightning and rain",
         "weather_symbol": "cloud.bolt.rain.fill",
         "weather_cloud_cover_pct": 87,
         "weather_wind_kph": 16.09,
@@ -66,6 +66,14 @@ def test_open_meteo_current_maps_to_ingest_schema() -> None:
     assert snapshot["weather_condition"] == "Rainy"
     assert snapshot["weather_precipitation"] == "Rain"
     assert snapshot["weather_symbol"] == "cloud.rain.fill"
+
+
+def test_hass_compact_condition_key_gets_a_readable_label() -> None:
+    snapshot = snapshot_from_hass_state(
+        {"state": "partlycloudy", "attributes": {"temperature": 29}}
+    )
+    assert snapshot is not None
+    assert snapshot["weather_condition"] == "Partly cloudy"
 
 
 @pytest.mark.parametrize(
