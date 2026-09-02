@@ -149,7 +149,7 @@ class ListeningHabitsProvider(PluginProvider):
         self._unregister_on_air: Callable[[], None] | None = None
         self._logged_total = 0
         self._session_started_at = int(datetime.now(UTC).timestamp())
-        self._server_count_cache: tuple[float, int] | None = None
+        self._server_status_cache: tuple[float, dict[str, Any]] | None = None
         self._failed_total = 0
         self._last_result: str | None = None
         self._last_error: str | None = None
@@ -719,13 +719,13 @@ class ListeningHabitsProvider(PluginProvider):
         else:
             self._failed_total += 1
 
-    async def _server_logged_total(self) -> int:
-        """Count all MA-backed listens recorded since this provider loaded."""
+    async def _server_session_status(self) -> dict[str, Any]:
+        """Read all MA-backed listens recorded since this provider loaded."""
         now = time.monotonic()
-        if self._server_count_cache and now - self._server_count_cache[0] < 10:
-            return self._server_count_cache[1]
+        if self._server_status_cache and now - self._server_status_cache[0] < 10:
+            return dict(self._server_status_cache[1])
         if not self._endpoint or not self._token:
-            return self._logged_total
+            return {"logged_total": self._logged_total, "last_logged": self._last_logged}
         try:
             async with self.mass.http_session.get(
                 f"{self._endpoint.rstrip('/')}/status",
@@ -735,12 +735,18 @@ class ListeningHabitsProvider(PluginProvider):
             ) as response:
                 response.raise_for_status()
                 payload = await response.json()
-                total = max(self._logged_total, int(payload.get("logged_total", 0)))
-                self._server_count_cache = (now, total)
-                return total
+                payload["logged_total"] = max(
+                    self._logged_total, int(payload.get("logged_total", 0))
+                )
+                local_at = float((self._last_logged or {}).get("at", 0))
+                server_at = float((payload.get("last_logged") or {}).get("at", 0))
+                if local_at > server_at:
+                    payload["last_logged"] = self._last_logged
+                self._server_status_cache = (now, payload)
+                return dict(payload)
         except Exception as err:
             self.logger.debug("Could not read Listening Habits session count: %s", err)
-            return self._logged_total
+            return {"logged_total": self._logged_total, "last_logged": self._last_logged}
 
     async def get_status(self) -> dict[str, Any]:
         """
@@ -754,17 +760,17 @@ class ListeningHabitsProvider(PluginProvider):
         Never returns the token, only whether one is set.
         """
         weather = await self._weather_snapshot()
-        logged_total = await self._server_logged_total()
+        session = await self._server_session_status()
         return {
             "configured": bool(self._endpoint and self._token),
             "endpoint": self._endpoint or None,
             "healthy": self._last_result in (None, "ok"),
             "backlog": await self._backlog.depth(),
-            "logged_total": logged_total,
+            "logged_total": session["logged_total"],
             "failed_total": self._failed_total,
             "last_result": self._last_result,
             "last_error": self._last_error,
-            "last_logged": self._last_logged,
+            "last_logged": session.get("last_logged"),
             "weather": weather or None,
             "weather_entity": self._weather_entity or None,
             "weather_source": self._weather_source,
