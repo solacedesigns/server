@@ -25,10 +25,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from music_assistant_models.enums import EventType, MediaType, ProviderFeature
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
+from music_assistant_models.enums import ConfigEntryType, EventType, MediaType, ProviderFeature
 from music_assistant_models.streamdetails import StreamMetadata
 
 from music_assistant.controllers.streams.constants import (
@@ -49,11 +51,12 @@ from .helpers import (
     on_air_url,
     station_playlist_url,
 )
+from .weather import snapshot_from_hass_state, snapshot_from_open_meteo
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
+    from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.event import MassEvent
     from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
     from music_assistant_models.provider import ProviderManifest
@@ -62,15 +65,20 @@ if TYPE_CHECKING:
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
+    from music_assistant.providers.hass import HomeAssistantProvider
 
 CONF_ENDPOINT = "endpoint"
 CONF_TOKEN = "_token"
 CONF_HOME_PLACE = "home_place_name"
+CONF_WEATHER_ENTITY = "weather_entity"
 
 # How often the backlog is retried regardless of new plays, so a queue that
 # built up overnight still drains even if nothing plays for a while.
 RETRY_INTERVAL_S = 300
 PUSH_TIMEOUT_S = 15
+WEATHER_FRESH_CACHE_S = 300
+WEATHER_STALE_FALLBACK_S = 1200
+WEATHER_TIMEOUT_S = 5
 
 # The on-air lookup is a scrape of the station's schedule page two hops away,
 # so it is cached rather than made once per asking client. A block's own
@@ -151,6 +159,12 @@ class ListeningHabitsProvider(PluginProvider):
         # title has no match yet, which is the window where the stream is ahead
         # of the feed and the same question gets asked every few seconds.
         self._playlist_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        # Successful observations only. A failed refresh must not erase the
+        # last known conditions, because they remain a useful fallback for a
+        # short window (while retaining their original observed_at value).
+        self._weather_cache: tuple[float, dict[str, Any] | None] | None = None
+        self._weather_retry_after = 0.0
+        self._weather_source: str | None = None
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -159,13 +173,33 @@ class ListeningHabitsProvider(PluginProvider):
         # a required entry with no default makes the provider impossible to
         # load. The endpoint, token and home place are collected by the setup
         # flow into setup_data instead, and read back via get_setup_value.
-        return tuple(await ScrobblerConfig.get_shared_config_entries(self.mass, None))
+        entries = list(await ScrobblerConfig.get_shared_config_entries(self.mass, None))
+        weather_entities: list[str] = []
+        if hass_provider := self.mass.get_provider("hass"):
+            hass = cast("HomeAssistantProvider", hass_provider)
+            try:
+                states = await hass.get_states(domains={"weather"})
+                weather_entities = [state["entity_id"] for state in states]
+            except Exception as err:
+                self.logger.debug("Could not discover HA weather entities: %s", err)
+        entries.append(
+            ConfigEntry(
+                key=CONF_WEATHER_ENTITY,
+                type=ConfigEntryType.STRING,
+                options=[ConfigValueOption(value=entity_id) for entity_id in weather_entities],
+                default_value=weather_entities[0] if weather_entities else "",
+                required=False,
+                advanced=True,
+            )
+        )
+        return tuple(entries)
 
     async def handle_async_init(self) -> None:
         """Read configuration and prepare the backlog."""
         self._endpoint = str(self.get_setup_value(CONF_ENDPOINT) or "").strip()
         self._token = str(self.get_setup_value(CONF_TOKEN) or "").strip()
         self._home_place = str(self.get_setup_value(CONF_HOME_PLACE) or "").strip() or None
+        self._weather_entity = str(self.config.get_value(CONF_WEATHER_ENTITY) or "").strip()
         self._scrobbler_config = ScrobblerConfig.create_from_config(self.config)
         self._backlog = DurableQueue(
             os.path.join(self.mass.storage_path, "listening_habits_queue.jsonl"),
@@ -420,6 +454,7 @@ class ListeningHabitsProvider(PluginProvider):
             return
 
         payload = self._build_payload(report)
+        payload.update(await self._weather_snapshot())
         if await self._push(payload):
             # Opportunistic drain: a push that just succeeded is good evidence
             # the server is reachable again.
@@ -503,6 +538,66 @@ class ListeningHabitsProvider(PluginProvider):
             "client_ref": f"ma:{report.player_id}:{int(played_at.timestamp())}",
             "ingest_method": "music_assistant",
         }
+
+    async def _weather_snapshot(self) -> dict[str, Any]:
+        """Return a cached best-effort observation from HA, then Open-Meteo."""
+        now = time.monotonic()
+        if self._weather_cache and now - self._weather_cache[0] < WEATHER_FRESH_CACHE_S:
+            return dict(self._weather_cache[1] or {})
+        if now < self._weather_retry_after:
+            if self._weather_cache and now - self._weather_cache[0] < WEATHER_STALE_FALLBACK_S:
+                return dict(self._weather_cache[1] or {})
+            return {}
+        snapshot: dict[str, Any] | None = None
+        hass = cast("HomeAssistantProvider | None", self.mass.get_provider("hass"))
+        try:
+            if hass:
+                states = await hass.get_states(
+                    entity_ids=[self._weather_entity] if self._weather_entity else None,
+                    domains=None if self._weather_entity else {"weather"},
+                )
+                if states:
+                    snapshot = snapshot_from_hass_state(states[0])
+                    if snapshot is not None:
+                        self._weather_source = states[0]["entity_id"]
+            if snapshot is None and hass:
+                config = await hass.hass.send_command("get_config")
+                latitude = config.get("latitude")
+                longitude = config.get("longitude")
+                if latitude is not None and longitude is not None:
+                    async with asyncio.timeout(WEATHER_TIMEOUT_S):
+                        async with self.mass.http_session.get(
+                            "https://api.open-meteo.com/v1/forecast",
+                            params={
+                                "latitude": latitude,
+                                "longitude": longitude,
+                                "current": (
+                                    "temperature_2m,apparent_temperature,weather_code,"
+                                    "cloud_cover,wind_speed_10m"
+                                ),
+                                "temperature_unit": "celsius",
+                                "wind_speed_unit": "kmh",
+                                "timezone": "auto",
+                            },
+                        ) as response:
+                            response.raise_for_status()
+                            snapshot = snapshot_from_open_meteo(await response.json())
+                            if snapshot is not None:
+                                self._weather_source = "Open-Meteo"
+        except Exception as err:
+            self.logger.debug("Weather snapshot unavailable: %s", err)
+        if snapshot is not None:
+            self._weather_cache = (now, snapshot)
+            self._weather_retry_after = 0.0
+            return dict(snapshot)
+        # Avoid putting two failing network calls in front of every song while
+        # either weather source is down. Try again when the normal fresh-cache
+        # interval has elapsed.
+        self._weather_retry_after = now + WEATHER_FRESH_CACHE_S
+        if self._weather_cache and now - self._weather_cache[0] < WEATHER_STALE_FALLBACK_S:
+            self.logger.debug("Using the last weather observation after refresh failure")
+            return dict(self._weather_cache[1] or {})
+        return {}
 
     def _describe_source_provider(self, instance_id: str | None) -> str | None:
         """Return a readable name for the streaming service, e.g. "Tidal"."""
@@ -633,6 +728,7 @@ class ListeningHabitsProvider(PluginProvider):
 
         Never returns the token, only whether one is set.
         """
+        weather = await self._weather_snapshot()
         return {
             "configured": bool(self._endpoint and self._token),
             "endpoint": self._endpoint or None,
@@ -643,6 +739,9 @@ class ListeningHabitsProvider(PluginProvider):
             "last_result": self._last_result,
             "last_error": self._last_error,
             "last_logged": self._last_logged,
+            "weather": weather or None,
+            "weather_entity": self._weather_entity or None,
+            "weather_source": self._weather_source,
         }
 
     async def get_on_air(self, station: str | None = None) -> dict[str, Any] | None:

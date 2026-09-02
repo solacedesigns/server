@@ -21,8 +21,51 @@ from music_assistant.providers.listening_habits.helpers import (
     on_air_url,
     station_playlist_url,
 )
+from music_assistant.providers.listening_habits.weather import (
+    snapshot_from_hass_state,
+    snapshot_from_open_meteo,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def test_hass_weather_state_maps_to_ingest_schema_and_converts_units() -> None:
+    snapshot = snapshot_from_hass_state(
+        {
+            "state": "lightning-rainy",
+            "last_updated": "2026-09-02T12:00:00Z",
+            "attributes": {
+                "temperature": 68,
+                "temperature_unit": "°F",
+                "apparent_temperature": 66.2,
+                "cloud_coverage": 87,
+                "wind_speed": 10,
+                "wind_speed_unit": "mph",
+            },
+        }
+    )
+    assert snapshot == {
+        "weather_observed_at": 1788350400,
+        "weather_temperature_c": 20.0,
+        "weather_apparent_temperature_c": 19.0,
+        "weather_condition": "Lightning rainy",
+        "weather_precipitation": "Lightning rainy",
+        "weather_symbol": "cloud.bolt.rain.fill",
+        "weather_cloud_cover_pct": 87,
+        "weather_wind_kph": 16.09,
+    }
+
+
+def test_open_meteo_current_maps_to_ingest_schema() -> None:
+    snapshot = snapshot_from_open_meteo(
+        {"current": {"time": "2026-09-02T07:00", "temperature_2m": 14.5,
+         "apparent_temperature": 13.2, "weather_code": 61, "cloud_cover": 92,
+         "wind_speed_10m": 8.4}}
+    )
+    assert snapshot is not None
+    assert snapshot["weather_condition"] == "Rainy"
+    assert snapshot["weather_precipitation"] == "Rain"
+    assert snapshot["weather_symbol"] == "cloud.rain.fill"
 
 
 @pytest.mark.parametrize(

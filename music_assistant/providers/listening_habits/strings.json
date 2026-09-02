@@ -11,6 +11,10 @@
     "home_place_name": {
       "label": "Home place name",
       "description": "Place recorded for players that live in one room. Leave blank to record no place."
+    },
+    "weather_entity": {
+      "label": "Home Assistant weather entity",
+      "description": "Current conditions to save with each listen. If unavailable, Music Assistant falls back to Open-Meteo using Home Assistant's home coordinates."
     }
   },
   "manifest": {

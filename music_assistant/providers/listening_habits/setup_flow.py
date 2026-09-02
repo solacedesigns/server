@@ -13,6 +13,7 @@ from music_assistant.providers.listening_habits import (
     CONF_ENDPOINT,
     CONF_HOME_PLACE,
     CONF_TOKEN,
+    CONF_WEATHER_ENTITY,
     PUSH_TIMEOUT_S,
 )
 
@@ -25,6 +26,7 @@ _ENTRIES = (
     ConfigEntry(key=CONF_ENDPOINT, type=ConfigEntryType.STRING, required=True),
     ConfigEntry(key=CONF_TOKEN, type=ConfigEntryType.SECURE_STRING, required=True),
     ConfigEntry(key=CONF_HOME_PLACE, type=ConfigEntryType.STRING, required=False, advanced=True),
+    ConfigEntry(key=CONF_WEATHER_ENTITY, type=ConfigEntryType.STRING, required=False, advanced=True),
 )
 
 
