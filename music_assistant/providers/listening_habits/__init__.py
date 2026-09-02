@@ -398,17 +398,20 @@ class ListeningHabitsProvider(PluginProvider):
 
         MEDIA_ITEM_PLAYED is signalled on *every* progress report, outside the
         `_should_mark_played` guard MA applies to its own playlog -- so a
-        consumer that does not repeat that logic double-counts. A track is
-        reported once as the current item as soon as it comes within 10s of the
-        end (`is_playing` still true), and again when the queue advances past
-        it; at end-of-queue the final track is reported twice over. Only the
-        report where playback has actually stopped is the real completion.
+        consumer that does not deduplicate double-counts. A track is usually
+        reported first as the current item when it comes within 10s of the end
+        (`is_playing` still true), then again when the queue advances past it.
+
+        The first fully-played report has to count. Some grouped/multi-room
+        queues do not emit the later stopped/advanced report, and MA's shared
+        scrobbler helper likewise treats `fully_played` alone as completion.
+        `_last_counted` suppresses the ordinary second report.
 
         Keyed on uri because the report carries no queue_item_id, unlike the
         guard upstream.
         """
         key = report.player_id or ""
-        if report.fully_played and not report.is_playing:
+        if report.fully_played:
             if self._last_counted.get(key) == report.uri:
                 return False
             self._last_counted[key] = report.uri

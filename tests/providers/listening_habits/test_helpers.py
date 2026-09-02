@@ -7,9 +7,11 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from music_assistant.providers.listening_habits import ListeningHabitsProvider
 from music_assistant.providers.listening_habits.helpers import (
     DurableQueue,
     QualityCache,
@@ -27,6 +29,41 @@ from music_assistant.providers.listening_habits.weather import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _playback_report(
+    *, fully_played: bool, is_playing: bool, uri: str = "track://one"
+) -> Any:
+    """Build the small report surface exercised by the completion guard."""
+    return type(
+        "PlaybackReport",
+        (),
+        {
+            "player_id": "multi-room-group",
+            "uri": uri,
+            "fully_played": fully_played,
+            "is_playing": is_playing,
+        },
+    )()
+
+
+def test_fully_played_group_report_logs_before_queue_advance() -> None:
+    """A multi-room queue may never send a later stopped/advanced report."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._last_counted = {}
+
+    assert provider._should_log(_playback_report(fully_played=True, is_playing=True))
+    assert not provider._should_log(_playback_report(fully_played=True, is_playing=False))
+
+
+def test_restarted_track_rearms_completion_guard() -> None:
+    """Repeat-one can count the same URI again after a non-complete report."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._last_counted = {}
+
+    assert provider._should_log(_playback_report(fully_played=True, is_playing=True))
+    assert not provider._should_log(_playback_report(fully_played=False, is_playing=True))
+    assert provider._should_log(_playback_report(fully_played=True, is_playing=True))
 
 
 def test_hass_weather_state_maps_to_ingest_schema_and_converts_units() -> None:
