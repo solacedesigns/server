@@ -148,6 +148,8 @@ class ListeningHabitsProvider(PluginProvider):
         self._unregister_api: Callable[[], None] | None = None
         self._unregister_on_air: Callable[[], None] | None = None
         self._logged_total = 0
+        self._session_started_at = int(datetime.now(UTC).timestamp())
+        self._server_count_cache: tuple[float, int] | None = None
         self._failed_total = 0
         self._last_result: str | None = None
         self._last_error: str | None = None
@@ -717,6 +719,29 @@ class ListeningHabitsProvider(PluginProvider):
         else:
             self._failed_total += 1
 
+    async def _server_logged_total(self) -> int:
+        """Count all MA-backed listens recorded since this provider loaded."""
+        now = time.monotonic()
+        if self._server_count_cache and now - self._server_count_cache[0] < 10:
+            return self._server_count_cache[1]
+        if not self._endpoint or not self._token:
+            return self._logged_total
+        try:
+            async with self.mass.http_session.get(
+                f"{self._endpoint.rstrip('/')}/status",
+                params={"since": self._session_started_at},
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=PUSH_TIMEOUT_S,
+            ) as response:
+                response.raise_for_status()
+                payload = await response.json()
+                total = max(self._logged_total, int(payload.get("logged_total", 0)))
+                self._server_count_cache = (now, total)
+                return total
+        except Exception as err:
+            self.logger.debug("Could not read Listening Habits session count: %s", err)
+            return self._logged_total
+
     async def get_status(self) -> dict[str, Any]:
         """
         Report ingest health, for the frontend's Now Playing indicator.
@@ -729,12 +754,13 @@ class ListeningHabitsProvider(PluginProvider):
         Never returns the token, only whether one is set.
         """
         weather = await self._weather_snapshot()
+        logged_total = await self._server_logged_total()
         return {
             "configured": bool(self._endpoint and self._token),
             "endpoint": self._endpoint or None,
             "healthy": self._last_result in (None, "ok"),
             "backlog": await self._backlog.depth(),
-            "logged_total": self._logged_total,
+            "logged_total": logged_total,
             "failed_total": self._failed_total,
             "last_result": self._last_result,
             "last_error": self._last_error,
