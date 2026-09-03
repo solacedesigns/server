@@ -13,12 +13,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import ProviderIconVariant
+from music_assistant_models.enums import MediaType, ProviderIconVariant
 
 from music_assistant.providers.listening_habits import (
     AMBIENT_SESSION_RESUME_GRACE_S,
     AMBIENT_SESSION_UPDATE_THRESHOLDS_S,
     ListeningHabitsProvider,
+    SUPPORTED_MEDIA_TYPES,
 )
 from music_assistant.providers.listening_habits.helpers import (
     DurableQueue,
@@ -37,6 +38,11 @@ from music_assistant.providers.listening_habits.weather import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def test_podcast_episodes_are_supported_listens() -> None:
+    """Completed podcast episodes reach the Listening Habits ingest path."""
+    assert MediaType.PODCAST_EPISODE in SUPPORTED_MEDIA_TYPES
 
 
 def _playback_report(

@@ -29,6 +29,7 @@ from music_assistant_models.media_items import (
     Artist,
     ItemMapping,
     MediaItemType,
+    PodcastEpisode,
 )
 from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
 
@@ -699,10 +700,19 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
                     )
 
         album: Album | ItemMapping | None = getattr(media_item, "album", None)
+        podcast = media_item.podcast if isinstance(media_item, PodcastEpisode) else None
         # signal 'media item played' event,
         # which is useful for plugins that want to do scrobbling
         artists: list[Artist | ItemMapping] = getattr(media_item, "artists", [])
         artists_names = [a.name for a in artists]
+        artist_name = (
+            podcast.name
+            if podcast
+            else (
+                getattr(media_item, "artist_str", None)
+                or (artists_names[0] if artists_names else None)
+            )
+        )
         self.mass.signal_event(
             EventType.MEDIA_ITEM_PLAYED,
             object_id=media_item.uri,
@@ -711,14 +721,10 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
                 media_type=media_item.media_type,
                 name=media_item.name,
                 version=getattr(media_item, "version", None),
-                artist=(
-                    getattr(media_item, "artist_str", None) or artists_names[0]
-                    if artists_names
-                    else None
-                ),
+                artist=artist_name,
                 artists=artists_names,
                 artist_mbids=[a.mbid for a in artists if a.mbid] if artists else None,
-                album=album.name if album else None,
+                album=album.name if album else podcast.name if podcast else None,
                 album_mbid=album.mbid if album else None,
                 album_artist=(album.artist_str if isinstance(album, Album) else None),
                 album_artist_mbids=(

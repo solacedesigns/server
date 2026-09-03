@@ -144,9 +144,12 @@ LAST_VERBATIM_KEY = "listening_habits_verbatim_title"
 
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
 
-# Radio is logged as well as tracks -- a station play is a listen. Anything
-# else (audiobook, podcast) is out of scope for this log for now.
-SUPPORTED_MEDIA_TYPES = frozenset({MediaType.TRACK, MediaType.RADIO, MediaType.SOUND_EFFECT})
+# Radio, podcast episodes and ambient sounds are listens too. Audiobooks stay
+# out of scope until they have session-style logging rather than one very long
+# completion-only row.
+SUPPORTED_MEDIA_TYPES = frozenset(
+    {MediaType.TRACK, MediaType.RADIO, MediaType.PODCAST_EPISODE, MediaType.SOUND_EFFECT}
+)
 
 
 async def setup(
@@ -558,7 +561,13 @@ class ListeningHabitsProvider(PluginProvider):
             "duration_s": duration_s if duration_s is not None else report.duration,
             "artwork_url": report.image_url,
             "source_type": source_type
-            or ("radio" if report.media_type is MediaType.RADIO else "streaming"),
+            or (
+                "radio"
+                if report.media_type is MediaType.RADIO
+                else "podcast"
+                if report.media_type is MediaType.PODCAST_EPISODE
+                else "streaming"
+            ),
             # The actual streaming service, not the string "Music Assistant" --
             # this is what collapsed every row to one provider before.
             "source_provider": self._describe_source_provider(
