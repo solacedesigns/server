@@ -284,6 +284,44 @@ async def test_podcast_session_logs_at_ten_minutes() -> None:
     assert provider._publish_podcast.await_args.args[2] == 600
 
 
+async def test_podcast_publish_distinguishes_episode_length_from_progress() -> None:
+    """Podcast payload carries total length, heard position and completion separately."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._build_payload = Mock(return_value={})
+    provider._push = AsyncMock(return_value=True)
+    provider._backlog = SimpleNamespace(drain=AsyncMock())
+    report = SimpleNamespace(duration=3179)
+    session = {"client_ref": "ma-podcast-session:listener:one", "weather": {}}
+
+    await provider._publish_podcast(report, session, 979)
+
+    provider._build_payload.assert_called_once_with(
+        report,
+        duration_s=3179,
+        source_type="podcast",
+        client_ref_prefix="ma-podcast-session",
+    )
+    payload = provider._push.await_args.args[0]
+    assert payload["podcast_position_s"] == 979
+    assert payload["podcast_completed"] is False
+
+
+async def test_completed_podcast_publish_marks_full_progress() -> None:
+    """The terminal report explicitly marks the same podcast row complete."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._build_payload = Mock(return_value={})
+    provider._push = AsyncMock(return_value=True)
+    provider._backlog = SimpleNamespace(drain=AsyncMock())
+    report = SimpleNamespace(duration=3179)
+    session = {"client_ref": "ma-podcast-session:listener:one", "weather": {}}
+
+    await provider._publish_podcast(report, session, 3179, completed=True)
+
+    payload = provider._push.await_args.args[0]
+    assert payload["podcast_position_s"] == 3179
+    assert payload["podcast_completed"] is True
+
+
 async def test_unfinished_podcast_session_survives_restart(tmp_path: Path) -> None:
     """Podcast identity and progress are restored from durable provider state."""
     provider = object.__new__(ListeningHabitsProvider)

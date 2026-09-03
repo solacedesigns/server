@@ -755,8 +755,8 @@ class ListeningHabitsProvider(PluginProvider):
         reported = int(session["reported"])
         if report.fully_played:
             self._last_counted[counted_key] = report.uri
-            duration = max(listened, int(report.duration or 0))
-            await self._publish_podcast(report, session, duration)
+            listened = max(listened, int(report.duration or 0))
+            await self._publish_podcast(report, session, listened, completed=True)
             self._podcast_sessions.pop(key, None)
             await self._save_podcast_sessions()
             return
@@ -789,19 +789,25 @@ class ListeningHabitsProvider(PluginProvider):
         self,
         report: MediaItemPlaybackProgressReport,
         session: dict[str, Any],
-        duration: int,
+        listened: int,
+        *,
+        completed: bool = False,
     ) -> None:
         """Insert or update the single row for a podcast listening session."""
         payload = self._build_payload(
             report,
-            duration_s=duration,
+            # duration_s describes the episode; podcast_position_s describes
+            # how much of this listening session has actually been heard.
+            duration_s=max(listened, int(report.duration or 0)),
             source_type="podcast",
             client_ref_prefix="ma-podcast-session",
         )
         payload["client_ref"] = session["client_ref"]
         payload["update_played_at"] = True
+        payload["podcast_position_s"] = listened
+        payload["podcast_completed"] = completed
         payload.update(session["weather"])
-        session["reported"] = duration
+        session["reported"] = listened
         if await self._push(payload):
             await self._backlog.drain(self._push)
         else:
