@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -254,6 +254,64 @@ async def test_audiobook_chapter_crossing_logs_separate_entry() -> None:
         client_ref_prefix="ma-audiobook-chapter-1",
     )
     provider._push.assert_awaited_once_with({"weather_temperature_c": 20})
+
+
+async def test_podcast_session_logs_at_ten_minutes() -> None:
+    """Podcast progress creates one session row after ten listened minutes."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._podcast_sessions = {}
+    provider._last_counted = {}
+    provider._weather_snapshot = AsyncMock(return_value={})
+    provider._save_podcast_sessions = AsyncMock()
+    provider._publish_podcast = AsyncMock()
+    provider.mass = SimpleNamespace(player_queues=SimpleNamespace(get=lambda _: None))
+    report = SimpleNamespace(
+        player_id="web-player",
+        userid="listener",
+        uri="apple_podcasts://podcast_episode/one",
+        seconds_played=0,
+        fully_played=False,
+        is_playing=True,
+        duration=3600,
+    )
+
+    await provider._handle_podcast_report(report)
+    for position in range(100, 601, 100):
+        report.seconds_played = position
+        await provider._handle_podcast_report(report)
+
+    provider._publish_podcast.assert_awaited_once()
+    assert provider._publish_podcast.await_args.args[2] == 600
+
+
+async def test_unfinished_podcast_session_survives_restart(tmp_path: Path) -> None:
+    """Podcast identity and progress are restored from durable provider state."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._podcast_state_lock = asyncio.Lock()
+    provider._podcast_state_path = str(tmp_path / "podcast-sessions.json")
+    provider._podcast_sessions = {
+        ("listener", "podcast://episode/one"): {
+            "started_at": datetime(2026, 9, 3, 8, 0, tzinfo=UTC),
+            "position": 1800,
+            "observed_at": 0.0,
+            "listened": 900,
+            "reported": 600,
+            "persisted_listened": 900,
+            "client_ref": "ma-podcast-session:listener:1788440400",
+            "weather": {"weather_temperature_c": 20},
+        }
+    }
+    await provider._save_podcast_sessions()
+
+    restored = object.__new__(ListeningHabitsProvider)
+    restored._podcast_state_path = provider._podcast_state_path
+    restored._podcast_sessions = {}
+    restored._load_podcast_sessions()
+
+    session = restored._podcast_sessions[("listener", "podcast://episode/one")]
+    assert session["listened"] == 900
+    assert session["reported"] == 600
+    assert session["client_ref"] == "ma-podcast-session:listener:1788440400"
 
 
 def test_hass_weather_state_maps_to_ingest_schema_and_converts_units() -> None:

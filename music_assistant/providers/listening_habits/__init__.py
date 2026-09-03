@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import time
 from datetime import UTC, datetime, timedelta
@@ -135,6 +136,10 @@ AMBIENT_SESSION_UPDATE_THRESHOLDS_S = tuple(
         360,
     )
 )
+PODCAST_SESSION_MIN_S = 10 * 60
+PODCAST_SESSION_UPDATE_THRESHOLDS_S = tuple(
+    minutes * 60 for minutes in (30, 60, 90, 120, 180, 240)
+)
 
 # Keys this provider owns inside StreamDetails.data, namespaced because the
 # dict is shared with Music Assistant's own in-band title handoff.
@@ -186,6 +191,11 @@ class ListeningHabitsProvider(PluginProvider):
         # (player_id, audiobook_uri) -> most recently observed absolute
         # position and chapter positions already logged during this run.
         self._audiobook_sessions: dict[tuple[str, str], dict[str, Any]] = {}
+        # Podcast entries appear while listening and retain one client_ref as
+        # their accumulated listening time crosses each update milestone.
+        self._podcast_sessions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._podcast_state_lock = asyncio.Lock()
+        self._podcast_state_path = ""
         # Successful refs, so updating a live ambient row does not inflate the
         # frontend's count of distinct listens this provider has logged.
         self._pushed_client_refs: set[str] = set()
@@ -255,6 +265,10 @@ class ListeningHabitsProvider(PluginProvider):
             os.path.join(self.mass.storage_path, "listening_habits_queue.jsonl"),
             self.logger,
         )
+        self._podcast_state_path = os.path.join(
+            self.mass.storage_path, "listening_habits_podcast_sessions.json"
+        )
+        await asyncio.to_thread(self._load_podcast_sessions)
 
     async def loaded_in_mass(self) -> None:
         """Subscribe to playback events once the provider is live."""
@@ -505,6 +519,10 @@ class ListeningHabitsProvider(PluginProvider):
         if report.media_type is MediaType.AUDIOBOOK:
             await self._log_completed_audiobook_chapters(report)
 
+        if report.media_type is MediaType.PODCAST_EPISODE:
+            await self._handle_podcast_report(report)
+            return
+
         if not self._should_log(report):
             self.logger.debug(
                 "skipped: %s (fully_played=%s, is_playing=%s)",
@@ -689,6 +707,161 @@ class ListeningHabitsProvider(PluginProvider):
                 await self._backlog.drain(self._push)
             else:
                 await self._backlog.append(payload)
+
+    async def _handle_podcast_report(self, report: MediaItemPlaybackProgressReport) -> None:
+        """Insert a podcast listen at ten minutes and refresh it at milestones."""
+        player_id = report.player_id or ""
+        actor_id = report.userid or player_id
+        key = (actor_id, report.uri)
+        counted_key = f"podcast:{actor_id}"
+        if report.fully_played and self._last_counted.get(counted_key) == report.uri:
+            return
+        now = time.monotonic()
+        position = max(0, int(report.seconds_played or 0))
+        session = self._podcast_sessions.get(key)
+
+        if session is None:
+            # Near the beginning, the first report's position is listening we
+            # just observed. A large initial position is a resumed episode and
+            # must not claim everything heard in an earlier session.
+            initial_listened = position if position <= 120 else 0
+            session = {
+                "started_at": datetime.now(tz=UTC) - timedelta(seconds=initial_listened),
+                "position": position,
+                "observed_at": now,
+                "listened": initial_listened,
+                "reported": 0,
+                "persisted_listened": initial_listened,
+                "client_ref": (
+                    f"ma-podcast-session:{actor_id}:"
+                    f"{int(datetime.now(tz=UTC).timestamp())}"
+                ),
+                "weather": await self._weather_snapshot(),
+            }
+            self._podcast_sessions[key] = session
+            await self._save_podcast_sessions()
+        else:
+            previous_position = int(session["position"])
+            wall_elapsed = max(0.0, now - float(session["observed_at"]))
+            advance = position - previous_position
+            session["position"] = position
+            session["observed_at"] = now
+            # Negative movement and implausibly fast forward movement are
+            # seeks. Observe the destination but do not count the skipped span.
+            if 0 < advance <= max(120, wall_elapsed * 3 + 30):
+                session["listened"] = int(session["listened"]) + advance
+
+        listened = int(session["listened"])
+        reported = int(session["reported"])
+        if report.fully_played:
+            self._last_counted[counted_key] = report.uri
+            duration = max(listened, int(report.duration or 0))
+            await self._publish_podcast(report, session, duration)
+            self._podcast_sessions.pop(key, None)
+            await self._save_podcast_sessions()
+            return
+
+        if self._last_counted.get(counted_key) == report.uri:
+            del self._last_counted[counted_key]
+
+        crossed_update = any(
+            reported < threshold <= listened
+            for threshold in PODCAST_SESSION_UPDATE_THRESHOLDS_S
+        )
+        if (reported == 0 and listened >= PODCAST_SESSION_MIN_S) or crossed_update:
+            await self._publish_podcast(report, session, listened)
+            await self._save_podcast_sessions()
+            return
+
+        # Preserve a useful final duration when playback stops after the row
+        # already exists but before the next scheduled milestone.
+        if not report.is_playing and reported and listened > reported:
+            queue = self.mass.player_queues.get(player_id)
+            if queue is None or queue.state is not PlaybackState.PAUSED:
+                await self._publish_podcast(report, session, listened)
+                await self._save_podcast_sessions()
+                return
+
+        if listened - int(session.get("persisted_listened", 0)) >= 30:
+            await self._save_podcast_sessions()
+
+    async def _publish_podcast(
+        self,
+        report: MediaItemPlaybackProgressReport,
+        session: dict[str, Any],
+        duration: int,
+    ) -> None:
+        """Insert or update the single row for a podcast listening session."""
+        payload = self._build_payload(
+            report,
+            played_at=session["started_at"],
+            duration_s=duration,
+            source_type="podcast",
+            client_ref_prefix="ma-podcast-session",
+        )
+        payload["client_ref"] = session["client_ref"]
+        payload.update(session["weather"])
+        session["reported"] = duration
+        if await self._push(payload):
+            await self._backlog.drain(self._push)
+        else:
+            await self._backlog.append(payload)
+
+    def _load_podcast_sessions(self) -> None:
+        """Restore unfinished podcast sessions from the provider storage directory."""
+        try:
+            with open(self._podcast_state_path, encoding="utf-8") as handle:
+                records = json.load(handle)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        if not isinstance(records, list):
+            return
+        observed_at = time.monotonic()
+        for record in records:
+            try:
+                actor_id = str(record["actor_id"])
+                uri = str(record["uri"])
+                listened = max(0, int(record["listened"]))
+                self._podcast_sessions[(actor_id, uri)] = {
+                    "started_at": datetime.fromtimestamp(int(record["started_at"]), tz=UTC),
+                    "position": max(0, int(record["position"])),
+                    "observed_at": observed_at,
+                    "listened": listened,
+                    "reported": max(0, int(record.get("reported", 0))),
+                    "persisted_listened": listened,
+                    "client_ref": str(record["client_ref"]),
+                    "weather": record.get("weather") or {},
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    async def _save_podcast_sessions(self) -> None:
+        """Atomically persist unfinished podcast sessions for restart-safe resumes."""
+        async with self._podcast_state_lock:
+            records = []
+            for (actor_id, uri), session in self._podcast_sessions.items():
+                records.append(
+                    {
+                        "actor_id": actor_id,
+                        "uri": uri,
+                        "started_at": int(session["started_at"].timestamp()),
+                        "position": int(session["position"]),
+                        "listened": int(session["listened"]),
+                        "reported": int(session["reported"]),
+                        "client_ref": session["client_ref"],
+                        "weather": session["weather"],
+                    }
+                )
+            await asyncio.to_thread(self._write_podcast_sessions, records)
+            for session in self._podcast_sessions.values():
+                session["persisted_listened"] = int(session["listened"])
+
+    def _write_podcast_sessions(self, records: list[dict[str, Any]]) -> None:
+        """Write podcast session state through a same-directory atomic replacement."""
+        temp_path = f"{self._podcast_state_path}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, separators=(",", ":"))
+        os.replace(temp_path, self._podcast_state_path)
 
     async def _handle_ambient_report(self, report: MediaItemPlaybackProgressReport) -> None:
         """Track an ambient sound, including brief Stop -> Play interruptions."""
