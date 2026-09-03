@@ -183,6 +183,9 @@ class ListeningHabitsProvider(PluginProvider):
         # (player_id, uri) -> start time, last elapsed value and the weather
         # observed when the ambient session began.
         self._ambient_sessions: dict[tuple[str, str], dict[str, Any]] = {}
+        # (player_id, audiobook_uri) -> most recently observed absolute
+        # position and chapter positions already logged during this run.
+        self._audiobook_sessions: dict[tuple[str, str], dict[str, Any]] = {}
         # Successful refs, so updating a live ambient row does not inflate the
         # frontend's count of distinct listens this provider has logged.
         self._pushed_client_refs: set[str] = set()
@@ -499,6 +502,9 @@ class ListeningHabitsProvider(PluginProvider):
             await self._handle_ambient_report(report)
             return
 
+        if report.media_type is MediaType.AUDIOBOOK:
+            await self._log_completed_audiobook_chapters(report)
+
         if not self._should_log(report):
             self.logger.debug(
                 "skipped: %s (fully_played=%s, is_playing=%s)",
@@ -538,6 +544,8 @@ class ListeningHabitsProvider(PluginProvider):
         duration_s: int | None = None,
         source_type: str | None = None,
         artist: str | None = None,
+        title: str | None = None,
+        album: str | None = None,
         client_ref_prefix: str = "ma",
     ) -> dict[str, Any]:
         """Map a playback report onto the log server's schema."""
@@ -551,17 +559,17 @@ class ListeningHabitsProvider(PluginProvider):
         stream_meta = streamdetails.stream_metadata if streamdetails else None
 
         device_type, room, device_name = self._describe_player(report.player_id)
-        title = report.name
-        if self._scrobbler_config.suffix_version and report.version:
-            title = f"{title} ({report.version})"
+        resolved_title = title or report.name
+        if title is None and self._scrobbler_config.suffix_version and report.version:
+            resolved_title = f"{resolved_title} ({report.version})"
 
         return {
             "played_at": int(played_at.timestamp()),
             "played_at_local": played_at.isoformat(timespec="seconds"),
             "tz_offset_minutes": int((played_at.utcoffset() or timedelta(0)).total_seconds() // 60),
             "artist": artist or report.artist,
-            "title": title,
-            "album": report.album,
+            "title": resolved_title,
+            "album": album if album is not None else report.album,
             "duration_s": duration_s if duration_s is not None else report.duration,
             "artwork_url": report.image_url,
             "source_type": source_type
@@ -611,6 +619,76 @@ class ListeningHabitsProvider(PluginProvider):
             "client_ref": f"{client_ref_prefix}:{report.player_id}:{int(played_at.timestamp())}",
             "ingest_method": "music_assistant",
         }
+
+    async def _log_completed_audiobook_chapters(
+        self, report: MediaItemPlaybackProgressReport
+    ) -> None:
+        """Log chapter boundaries crossed through ordinary audiobook playback."""
+        key = (report.player_id or "", report.uri)
+        now = time.monotonic()
+        elapsed = max(0, int(report.seconds_played or 0))
+        session = self._audiobook_sessions.get(key)
+        if session is None:
+            self._audiobook_sessions[key] = {
+                "elapsed": elapsed,
+                "observed_at": now,
+                "logged": set(),
+            }
+            return
+
+        previous = int(session["elapsed"])
+        wall_elapsed = max(0.0, now - float(session["observed_at"]))
+        session["elapsed"] = elapsed
+        session["observed_at"] = now
+
+        if elapsed <= previous:
+            return
+        # A position leap substantially faster than real playback is a seek,
+        # not listening. Start observing at the destination without crediting
+        # the chapters jumped over. The generous margin tolerates sparse
+        # player updates and accelerated audiobook playback.
+        if elapsed - previous > max(120, wall_elapsed * 3 + 30):
+            return
+
+        try:
+            item = await self.mass.music.get_item_by_uri(report.uri)
+        except Exception as err:
+            self.logger.debug("Could not resolve audiobook chapters for %s: %s", report.uri, err)
+            return
+        chapters = sorted(
+            item.metadata.chapters or [], key=lambda chapter: (chapter.start, chapter.position)
+        )
+        if not chapters:
+            return
+
+        logged: set[int] = session["logged"]
+        for index, chapter in enumerate(chapters):
+            chapter_end = chapter.end
+            if chapter_end is None and index + 1 < len(chapters):
+                chapter_end = chapters[index + 1].start
+            if chapter_end is None:
+                chapter_end = report.duration
+            if not chapter_end or chapter_end <= chapter.start:
+                continue
+            if chapter.position in logged or not (previous < chapter_end <= elapsed):
+                continue
+
+            duration = max(1, int(chapter_end - chapter.start))
+            payload = self._build_payload(
+                report,
+                duration_s=duration,
+                source_type="audiobook",
+                artist=report.artist or "Unknown Author",
+                title=chapter.name or f"Chapter {chapter.position}",
+                album=report.name,
+                client_ref_prefix=f"ma-audiobook-chapter-{chapter.position}",
+            )
+            payload.update(await self._weather_snapshot())
+            logged.add(chapter.position)
+            if await self._push(payload):
+                await self._backlog.drain(self._push)
+            else:
+                await self._backlog.append(payload)
 
     async def _handle_ambient_report(self, report: MediaItemPlaybackProgressReport) -> None:
         """Track an ambient sound, including brief Stop -> Play interruptions."""

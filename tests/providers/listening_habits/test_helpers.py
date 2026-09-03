@@ -218,6 +218,44 @@ async def test_ambient_stop_and_quick_resume_keeps_session_and_duration() -> Non
     assert provider._last_counted == {}
 
 
+async def test_audiobook_chapter_crossing_logs_separate_entry() -> None:
+    """Crossing a chapter end publishes that chapter under its book."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._audiobook_sessions = {}
+    provider._build_payload = MagicMock(return_value={})
+    provider._weather_snapshot = AsyncMock(return_value={"weather_temperature_c": 20})
+    provider._push = AsyncMock(return_value=True)
+    provider._backlog = SimpleNamespace(drain=AsyncMock(), append=AsyncMock())
+    chapter = SimpleNamespace(position=1, name="Opening Credits", start=0, end=19)
+    audiobook = SimpleNamespace(metadata=SimpleNamespace(chapters=[chapter]))
+    provider.mass = SimpleNamespace(
+        music=SimpleNamespace(get_item_by_uri=AsyncMock(return_value=audiobook))
+    )
+    report = SimpleNamespace(
+        player_id="web-player",
+        uri="audible://audiobook/book-one",
+        name="Do What You Want",
+        artist="Bad Religion / Jim Ruland",
+        seconds_played=8,
+        duration=3600,
+    )
+
+    await provider._log_completed_audiobook_chapters(report)
+    report.seconds_played = 20
+    await provider._log_completed_audiobook_chapters(report)
+
+    provider._build_payload.assert_called_once_with(
+        report,
+        duration_s=19,
+        source_type="audiobook",
+        artist="Bad Religion / Jim Ruland",
+        title="Opening Credits",
+        album="Do What You Want",
+        client_ref_prefix="ma-audiobook-chapter-1",
+    )
+    provider._push.assert_awaited_once_with({"weather_temperature_c": 20})
+
+
 def test_hass_weather_state_maps_to_ingest_schema_and_converts_units() -> None:
     snapshot = snapshot_from_hass_state(
         {
