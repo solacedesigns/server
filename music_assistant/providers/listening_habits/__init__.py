@@ -110,6 +110,7 @@ STREAM_METADATA_INTERVAL_S = 5
 PLAYLIST_TIMEOUT_S = 10
 PLAYLIST_CACHE_S = 10
 AMBIENT_SESSION_MIN_S = 10 * 60
+AMBIENT_SESSION_UPDATE_S = 15 * 60
 
 # Keys this provider owns inside StreamDetails.data, namespaced because the
 # dict is shared with Music Assistant's own in-band title handoff.
@@ -151,6 +152,9 @@ class ListeningHabitsProvider(PluginProvider):
         # (player_id, uri) -> start time, last elapsed value and the weather
         # observed when the ambient session began.
         self._ambient_sessions: dict[tuple[str, str], dict[str, Any]] = {}
+        # Successful refs, so updating a live ambient row does not inflate the
+        # frontend's count of distinct listens this provider has logged.
+        self._pushed_client_refs: set[str] = set()
         # What the Now Playing indicator reports. Held in memory only: it
         # describes this run of the provider, and a restart genuinely has
         # nothing to say about pushes it did not make. The backlog on disk is
@@ -581,6 +585,7 @@ class ListeningHabitsProvider(PluginProvider):
             session = {
                 "started_at": now - timedelta(seconds=elapsed),
                 "elapsed": elapsed,
+                "reported_elapsed": 0,
                 "weather": await self._weather_snapshot(),
             }
             self._ambient_sessions[key] = session
@@ -591,6 +596,12 @@ class ListeningHabitsProvider(PluginProvider):
             # A fresh progress event re-arms the same URI for a later session.
             if self._last_counted.get(player_id) == report.uri:
                 del self._last_counted[player_id]
+            reported_elapsed = int(session["reported_elapsed"])
+            if elapsed >= AMBIENT_SESSION_MIN_S and (
+                reported_elapsed == 0
+                or elapsed - reported_elapsed >= AMBIENT_SESSION_UPDATE_S
+            ):
+                await self._publish_ambient(report, session, elapsed)
             return
 
         queue = self.mass.player_queues.get(player_id)
@@ -611,6 +622,15 @@ class ListeningHabitsProvider(PluginProvider):
             return
         self._last_counted[player_id] = report.uri
 
+        await self._publish_ambient(report, session, elapsed)
+
+    async def _publish_ambient(
+        self,
+        report: MediaItemPlaybackProgressReport,
+        session: dict[str, Any],
+        elapsed: int,
+    ) -> None:
+        """Insert or refresh the single row representing an ambient session."""
         payload = self._build_payload(
             report,
             played_at=session["started_at"],
@@ -620,6 +640,9 @@ class ListeningHabitsProvider(PluginProvider):
             client_ref_prefix="ma-ambient",
         )
         payload.update(session["weather"])
+        # Mark the interval when queued too; otherwise every progress report
+        # would append another copy while the endpoint is unavailable.
+        session["reported_elapsed"] = elapsed
         if await self._push(payload):
             await self._backlog.drain(self._push)
         else:
@@ -748,7 +771,11 @@ class ListeningHabitsProvider(PluginProvider):
             ) as response:
                 if response.status < 300:
                     self.logger.debug("logged %s - %s", payload.get("artist"), payload.get("title"))
-                    self._note_result("ok")
+                    client_ref = payload.get("client_ref")
+                    is_new_listen = not client_ref or client_ref not in self._pushed_client_refs
+                    if client_ref:
+                        self._pushed_client_refs.add(client_ref)
+                    self._note_result("ok", count_success=is_new_listen)
                     self._last_logged = {
                         "artist": payload.get("artist"),
                         "title": payload.get("title"),
@@ -787,7 +814,13 @@ class ListeningHabitsProvider(PluginProvider):
             self._note_result("error", str(err))
         return False
 
-    def _note_result(self, result: str, error: str | None = None) -> None:
+    def _note_result(
+        self,
+        result: str,
+        error: str | None = None,
+        *,
+        count_success: bool = True,
+    ) -> None:
         """
         Remember how the last push went, for the Now Playing indicator.
 
@@ -798,9 +831,9 @@ class ListeningHabitsProvider(PluginProvider):
         """
         self._last_result = result
         self._last_error = error
-        if result == "ok":
+        if result == "ok" and count_success:
             self._logged_total += 1
-        else:
+        elif result != "ok":
             self._failed_total += 1
 
     async def _server_session_status(self) -> dict[str, Any]:

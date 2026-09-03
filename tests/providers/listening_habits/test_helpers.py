@@ -68,8 +68,8 @@ def test_restarted_track_rearms_completion_guard() -> None:
     assert provider._should_log(_playback_report(fully_played=True, is_playing=True))
 
 
-async def test_ambient_session_logs_once_after_ten_minutes() -> None:
-    """An ambient sound becomes one listen only when the session ends."""
+async def test_ambient_session_is_inserted_refreshed_and_finalized() -> None:
+    """One ambient row appears at ten minutes and receives duration updates."""
     provider = object.__new__(ListeningHabitsProvider)
     provider._ambient_sessions = {}
     provider._last_counted = {}
@@ -82,26 +82,44 @@ async def test_ambient_session_logs_once_after_ten_minutes() -> None:
         player_id="player-one",
         uri="ambient_sounds://sound_effect/rain",
         name="Rain",
-        seconds_played=600,
+        seconds_played=599,
         is_playing=True,
     )
 
     await provider._handle_ambient_report(report)
     provider._push.assert_not_awaited()
 
+    report.seconds_played = 600
+    await provider._handle_ambient_report(report)
+    provider._push.assert_awaited_once_with({"weather_temperature_c": 20})
+
+    report.seconds_played = 1499
+    await provider._handle_ambient_report(report)
+    assert provider._push.await_count == 1
+
+    report.seconds_played = 1500
+    await provider._handle_ambient_report(report)
+    assert provider._push.await_count == 2
+
+    report.seconds_played = 1600
     report.is_playing = False
     await provider._handle_ambient_report(report)
 
-    provider._build_payload.assert_called_once_with(
-        report,
-        played_at=provider._build_payload.call_args.kwargs["played_at"],
-        duration_s=600,
-        source_type="ambient",
-        artist="Ambient Sounds",
-        client_ref_prefix="ma-ambient",
-    )
-    provider._push.assert_awaited_once_with({"weather_temperature_c": 20})
-    provider._backlog.drain.assert_awaited_once()
+    assert [call.kwargs["duration_s"] for call in provider._build_payload.call_args_list] == [
+        600,
+        1500,
+        1600,
+    ]
+    played_at_values = {
+        call.kwargs["played_at"] for call in provider._build_payload.call_args_list
+    }
+    assert len(played_at_values) == 1
+    for call in provider._build_payload.call_args_list:
+        assert call.kwargs["source_type"] == "ambient"
+        assert call.kwargs["artist"] == "Ambient Sounds"
+        assert call.kwargs["client_ref_prefix"] == "ma-ambient"
+    assert provider._push.await_count == 3
+    assert provider._backlog.drain.await_count == 3
 
 
 async def test_short_ambient_session_is_discarded() -> None:
