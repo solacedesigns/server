@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,6 +16,7 @@ import pytest
 from music_assistant_models.enums import ProviderIconVariant
 
 from music_assistant.providers.listening_habits import (
+    AMBIENT_SESSION_RESUME_GRACE_S,
     AMBIENT_SESSION_UPDATE_THRESHOLDS_S,
     ListeningHabitsProvider,
 )
@@ -166,6 +168,43 @@ async def test_short_ambient_session_is_discarded() -> None:
     await provider._handle_ambient_report(report)
 
     provider._push.assert_not_awaited()
+
+
+async def test_ambient_stop_and_quick_resume_keeps_session_and_duration() -> None:
+    """Stop -> Play inside the grace period updates the original ambient row."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._ambient_sessions = {}
+    provider._last_counted = {}
+    provider._weather_snapshot = AsyncMock(return_value={})
+    provider._build_payload = MagicMock(return_value={"artwork_url": "https://cover"})
+    provider._push = AsyncMock(return_value=True)
+    provider._backlog = SimpleNamespace(drain=AsyncMock(), append=AsyncMock())
+    provider.mass = SimpleNamespace(player_queues=SimpleNamespace(get=lambda _: None))
+    report = SimpleNamespace(
+        player_id="player-one",
+        uri="rain_mood://sound_effect/rain",
+        name="Rain",
+        seconds_played=600,
+        is_playing=True,
+    )
+
+    await provider._handle_ambient_report(report)
+    original_start = provider._ambient_sessions[(report.player_id, report.uri)]["started_at"]
+
+    report.seconds_played = 650
+    report.is_playing = False
+    await provider._handle_ambient_report(report)
+
+    session = provider._ambient_sessions[(report.player_id, report.uri)]
+    session["stopped_at"] -= timedelta(seconds=AMBIENT_SESSION_RESUME_GRACE_S - 1)
+    report.seconds_played = 10
+    report.is_playing = True
+    await provider._handle_ambient_report(report)
+
+    assert session["started_at"] == original_start
+    assert session["elapsed"] == 660
+    assert "stopped_at" not in session
+    assert provider._last_counted == {}
 
 
 def test_hass_weather_state_maps_to_ingest_schema_and_converts_units() -> None:

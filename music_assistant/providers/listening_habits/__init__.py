@@ -113,6 +113,7 @@ STREAM_METADATA_INTERVAL_S = 5
 PLAYLIST_TIMEOUT_S = 10
 PLAYLIST_CACHE_S = 10
 AMBIENT_SESSION_MIN_S = 10 * 60
+AMBIENT_SESSION_RESUME_GRACE_S = 5 * 60
 AMBIENT_SESSION_UPDATE_THRESHOLDS_S = tuple(
     minutes * 60
     for minutes in (
@@ -597,23 +598,39 @@ class ListeningHabitsProvider(PluginProvider):
         }
 
     async def _handle_ambient_report(self, report: MediaItemPlaybackProgressReport) -> None:
-        """Track an ambient sound and log one row when its session ends."""
+        """Track an ambient sound, including brief Stop -> Play interruptions."""
         player_id = report.player_id or ""
         key = (player_id, report.uri)
-        elapsed = max(0, int(report.seconds_played or 0))
+        segment_elapsed = max(0, int(report.seconds_played or 0))
         now = datetime.now(tz=UTC)
         session = self._ambient_sessions.get(key)
 
+        if session is not None and report.is_playing and "stopped_at" in session:
+            stopped_for = (now - session["stopped_at"]).total_seconds()
+            if stopped_for <= AMBIENT_SESSION_RESUME_GRACE_S:
+                # MA normally resets seconds_played after Stop -> Play. Keep
+                # the earlier segment as an offset so the log row's duration
+                # remains cumulative while excluding the stopped interval.
+                prior_elapsed = int(session["elapsed"])
+                session["segment_offset"] = (
+                    prior_elapsed if segment_elapsed < prior_elapsed else 0
+                )
+                del session["stopped_at"]
+            else:
+                session = None
+
         if session is None:
             session = {
-                "started_at": now - timedelta(seconds=elapsed),
-                "elapsed": elapsed,
+                "started_at": now - timedelta(seconds=segment_elapsed),
+                "elapsed": segment_elapsed,
+                "segment_offset": 0,
                 "reported_elapsed": 0,
                 "weather": await self._weather_snapshot(),
             }
             self._ambient_sessions[key] = session
-        else:
-            session["elapsed"] = max(int(session["elapsed"]), elapsed)
+
+        elapsed = int(session.get("segment_offset", 0)) + segment_elapsed
+        session["elapsed"] = max(int(session["elapsed"]), elapsed)
 
         if report.is_playing:
             # A fresh progress event re-arms the same URI for a later session.
@@ -634,8 +651,8 @@ class ListeningHabitsProvider(PluginProvider):
         if queue is not None and queue.state is PlaybackState.PAUSED:
             return
 
-        self._ambient_sessions.pop(key, None)
         elapsed = max(elapsed, int(session["elapsed"]))
+        session.setdefault("stopped_at", now)
         if elapsed < AMBIENT_SESSION_MIN_S:
             self.logger.debug(
                 "skipped ambient session shorter than %ss: %s (%ss)",
