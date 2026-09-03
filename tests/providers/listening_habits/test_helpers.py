@@ -291,19 +291,24 @@ async def test_podcast_publish_distinguishes_episode_length_from_progress() -> N
     provider._push = AsyncMock(return_value=True)
     provider._backlog = SimpleNamespace(drain=AsyncMock())
     report = SimpleNamespace(duration=3179)
-    session = {"client_ref": "ma-podcast-session:listener:one", "weather": {}}
+    session = {
+        "client_ref": "ma-podcast-session:listener:one",
+        "started_at": datetime(2026, 9, 3, 15, 1, tzinfo=UTC),
+        "weather": {},
+    }
 
     await provider._publish_podcast(report, session, 979)
 
-    provider._build_payload.assert_called_once_with(
-        report,
-        duration_s=3179,
-        source_type="podcast",
-        client_ref_prefix="ma-podcast-session",
-    )
+    call = provider._build_payload.call_args
+    assert call.args == (report,)
+    assert call.kwargs["duration_s"] == 3179
+    assert call.kwargs["source_type"] == "podcast"
+    assert call.kwargs["client_ref_prefix"] == "ma-podcast-session"
+    assert call.kwargs["played_at"] is session["started_at"]
     payload = provider._push.await_args.args[0]
     assert payload["podcast_position_s"] == 979
     assert payload["podcast_completed"] is False
+    assert abs(payload["podcast_checked_at"] - int(datetime.now(tz=UTC).timestamp())) < 2
 
 
 async def test_completed_podcast_publish_marks_full_progress() -> None:
@@ -313,7 +318,11 @@ async def test_completed_podcast_publish_marks_full_progress() -> None:
     provider._push = AsyncMock(return_value=True)
     provider._backlog = SimpleNamespace(drain=AsyncMock())
     report = SimpleNamespace(duration=3179)
-    session = {"client_ref": "ma-podcast-session:listener:one", "weather": {}}
+    session = {
+        "client_ref": "ma-podcast-session:listener:one",
+        "started_at": datetime(2026, 9, 3, 15, 1, tzinfo=UTC),
+        "weather": {},
+    }
 
     await provider._publish_podcast(report, session, 3179, completed=True)
 

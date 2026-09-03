@@ -796,6 +796,7 @@ class ListeningHabitsProvider(PluginProvider):
         """Insert or update the single row for a podcast listening session."""
         payload = self._build_payload(
             report,
+            played_at=session["started_at"],
             # duration_s describes the episode; podcast_position_s describes
             # how much of this listening session has actually been heard.
             duration_s=max(listened, int(report.duration or 0)),
@@ -803,7 +804,9 @@ class ListeningHabitsProvider(PluginProvider):
             client_ref_prefix="ma-podcast-session",
         )
         payload["client_ref"] = session["client_ref"]
-        payload["update_played_at"] = True
+        checked_at = datetime.now(tz=UTC).astimezone()
+        payload["podcast_checked_at"] = int(checked_at.timestamp())
+        payload["podcast_checked_at_local"] = checked_at.isoformat(timespec="seconds")
         payload["podcast_position_s"] = listened
         payload["podcast_completed"] = completed
         payload.update(session["weather"])
