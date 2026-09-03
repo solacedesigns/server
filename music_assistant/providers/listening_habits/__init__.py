@@ -110,7 +110,27 @@ STREAM_METADATA_INTERVAL_S = 5
 PLAYLIST_TIMEOUT_S = 10
 PLAYLIST_CACHE_S = 10
 AMBIENT_SESSION_MIN_S = 10 * 60
-AMBIENT_SESSION_UPDATE_S = 15 * 60
+AMBIENT_SESSION_UPDATE_THRESHOLDS_S = tuple(
+    minutes * 60
+    for minutes in (
+        30,
+        45,
+        60,
+        75,
+        90,
+        120,
+        135,
+        150,
+        165,
+        180,
+        210,
+        240,
+        270,
+        300,
+        330,
+        360,
+    )
+)
 
 # Keys this provider owns inside StreamDetails.data, namespaced because the
 # dict is shared with Music Assistant's own in-band title handoff.
@@ -597,10 +617,13 @@ class ListeningHabitsProvider(PluginProvider):
             if self._last_counted.get(player_id) == report.uri:
                 del self._last_counted[player_id]
             reported_elapsed = int(session["reported_elapsed"])
-            if elapsed >= AMBIENT_SESSION_MIN_S and (
-                reported_elapsed == 0
-                or elapsed - reported_elapsed >= AMBIENT_SESSION_UPDATE_S
-            ):
+            crossed_update = any(
+                reported_elapsed < threshold <= elapsed
+                for threshold in AMBIENT_SESSION_UPDATE_THRESHOLDS_S
+            )
+            if (
+                reported_elapsed == 0 and elapsed >= AMBIENT_SESSION_MIN_S
+            ) or crossed_update:
                 await self._publish_ambient(report, session, elapsed)
             return
 

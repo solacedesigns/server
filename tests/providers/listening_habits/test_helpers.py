@@ -13,7 +13,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from music_assistant.providers.listening_habits import ListeningHabitsProvider
+from music_assistant.providers.listening_habits import (
+    AMBIENT_SESSION_UPDATE_THRESHOLDS_S,
+    ListeningHabitsProvider,
+)
 from music_assistant.providers.listening_habits.helpers import (
     DurableQueue,
     QualityCache,
@@ -93,23 +96,26 @@ async def test_ambient_session_is_inserted_refreshed_and_finalized() -> None:
     await provider._handle_ambient_report(report)
     provider._push.assert_awaited_once_with({"weather_temperature_c": 20})
 
-    report.seconds_played = 1499
-    await provider._handle_ambient_report(report)
-    assert provider._push.await_count == 1
+    for update_number, threshold in enumerate(
+        AMBIENT_SESSION_UPDATE_THRESHOLDS_S, start=2
+    ):
+        report.seconds_played = threshold - 1
+        await provider._handle_ambient_report(report)
+        assert provider._push.await_count == update_number - 1
 
-    report.seconds_played = 1500
-    await provider._handle_ambient_report(report)
-    assert provider._push.await_count == 2
+        report.seconds_played = threshold
+        await provider._handle_ambient_report(report)
+        assert provider._push.await_count == update_number
 
-    report.seconds_played = 1600
+    report.seconds_played = AMBIENT_SESSION_UPDATE_THRESHOLDS_S[-1] + 60
     report.is_playing = False
     await provider._handle_ambient_report(report)
 
-    assert [call.kwargs["duration_s"] for call in provider._build_payload.call_args_list] == [
-        600,
-        1500,
-        1600,
-    ]
+    expected_durations = [600, *AMBIENT_SESSION_UPDATE_THRESHOLDS_S]
+    expected_durations.append(AMBIENT_SESSION_UPDATE_THRESHOLDS_S[-1] + 60)
+    assert [
+        call.kwargs["duration_s"] for call in provider._build_payload.call_args_list
+    ] == expected_durations
     played_at_values = {
         call.kwargs["played_at"] for call in provider._build_payload.call_args_list
     }
@@ -118,8 +124,9 @@ async def test_ambient_session_is_inserted_refreshed_and_finalized() -> None:
         assert call.kwargs["source_type"] == "ambient"
         assert call.kwargs["artist"] == "Ambient Sounds"
         assert call.kwargs["client_ref_prefix"] == "ma-ambient"
-    assert provider._push.await_count == 3
-    assert provider._backlog.drain.await_count == 3
+    expected_pushes = len(expected_durations)
+    assert provider._push.await_count == expected_pushes
+    assert provider._backlog.drain.await_count == expected_pushes
 
 
 async def test_short_ambient_session_is_discarded() -> None:
