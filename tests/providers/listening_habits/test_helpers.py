@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from music_assistant_models.enums import ProviderIconVariant
 
 from music_assistant.providers.listening_habits import (
     AMBIENT_SESSION_UPDATE_THRESHOLDS_S,
@@ -80,7 +81,15 @@ async def test_ambient_session_is_inserted_refreshed_and_finalized() -> None:
     provider._build_payload = MagicMock(return_value={})
     provider._push = AsyncMock(return_value=True)
     provider._backlog = SimpleNamespace(drain=AsyncMock(), append=AsyncMock())
-    provider.mass = SimpleNamespace(player_queues=SimpleNamespace(get=lambda _: None))
+    provider.mass = SimpleNamespace(
+        player_queues=SimpleNamespace(get=lambda _: None),
+        get_provider_icon_data=MagicMock(return_value="data:image/svg+xml;base64,cmFpbg=="),
+        metadata=SimpleNamespace(
+            get_image_url=MagicMock(
+                return_value="http://music-assistant/imageproxy/rain-mood?size=0&fmt=svg"
+            )
+        ),
+    )
     report = SimpleNamespace(
         player_id="player-one",
         uri="ambient_sounds://sound_effect/rain",
@@ -94,7 +103,12 @@ async def test_ambient_session_is_inserted_refreshed_and_finalized() -> None:
 
     report.seconds_played = 600
     await provider._handle_ambient_report(report)
-    provider._push.assert_awaited_once_with({"weather_temperature_c": 20})
+    provider._push.assert_awaited_once_with(
+        {
+            "artwork_url": "http://music-assistant/imageproxy/rain-mood?size=0&fmt=svg",
+            "weather_temperature_c": 20,
+        }
+    )
 
     for update_number, threshold in enumerate(
         AMBIENT_SESSION_UPDATE_THRESHOLDS_S, start=2
@@ -124,6 +138,9 @@ async def test_ambient_session_is_inserted_refreshed_and_finalized() -> None:
         assert call.kwargs["source_type"] == "ambient"
         assert call.kwargs["artist"] == "Ambient Sounds"
         assert call.kwargs["client_ref_prefix"] == "ma-ambient"
+    provider.mass.get_provider_icon_data.assert_called_with(
+        "ambient_sounds", ProviderIconVariant.DARK
+    )
     expected_pushes = len(expected_durations)
     assert provider._push.await_count == expected_pushes
     assert provider._backlog.drain.await_count == expected_pushes

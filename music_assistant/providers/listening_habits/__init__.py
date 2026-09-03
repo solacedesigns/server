@@ -33,10 +33,13 @@ from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import (
     ConfigEntryType,
     EventType,
+    ImageType,
     MediaType,
     PlaybackState,
     ProviderFeature,
+    ProviderIconVariant,
 )
+from music_assistant_models.media_items import MediaItemImage
 from music_assistant_models.streamdetails import StreamMetadata
 
 from music_assistant.controllers.streams.constants import (
@@ -662,6 +665,24 @@ class ListeningHabitsProvider(PluginProvider):
             artist="Ambient Sounds",
             client_ref_prefix="ma-ambient",
         )
+        if not payload.get("artwork_url"):
+            # Sound-effect providers commonly have a provider icon but no
+            # album-style media image. Register that bundled source artwork
+            # with MA's existing image proxy, which Listening Habits already
+            # knows how to relay to browsers securely.
+            source_provider = report.uri.partition("://")[0]
+            icon_data = self.mass.get_provider_icon_data(
+                source_provider, ProviderIconVariant.DARK
+            )
+            if icon_data:
+                payload["artwork_url"] = self.mass.metadata.get_image_url(
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=icon_data,
+                        provider=source_provider,
+                        remotely_accessible=False,
+                    )
+                )
         payload.update(session["weather"])
         # Mark the interval when queued too; otherwise every progress report
         # would append another copy while the endpoint is unavailable.
