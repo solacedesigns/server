@@ -7,7 +7,9 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -64,6 +66,64 @@ def test_restarted_track_rearms_completion_guard() -> None:
     assert provider._should_log(_playback_report(fully_played=True, is_playing=True))
     assert not provider._should_log(_playback_report(fully_played=False, is_playing=True))
     assert provider._should_log(_playback_report(fully_played=True, is_playing=True))
+
+
+async def test_ambient_session_logs_once_after_ten_minutes() -> None:
+    """An ambient sound becomes one listen only when the session ends."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._ambient_sessions = {}
+    provider._last_counted = {}
+    provider._weather_snapshot = AsyncMock(return_value={"weather_temperature_c": 20})
+    provider._build_payload = MagicMock(return_value={})
+    provider._push = AsyncMock(return_value=True)
+    provider._backlog = SimpleNamespace(drain=AsyncMock(), append=AsyncMock())
+    provider.mass = SimpleNamespace(player_queues=SimpleNamespace(get=lambda _: None))
+    report = SimpleNamespace(
+        player_id="player-one",
+        uri="ambient_sounds://sound_effect/rain",
+        name="Rain",
+        seconds_played=600,
+        is_playing=True,
+    )
+
+    await provider._handle_ambient_report(report)
+    provider._push.assert_not_awaited()
+
+    report.is_playing = False
+    await provider._handle_ambient_report(report)
+
+    provider._build_payload.assert_called_once_with(
+        report,
+        played_at=provider._build_payload.call_args.kwargs["played_at"],
+        duration_s=600,
+        source_type="ambient",
+        artist="Ambient Sounds",
+        client_ref_prefix="ma-ambient",
+    )
+    provider._push.assert_awaited_once_with({"weather_temperature_c": 20})
+    provider._backlog.drain.assert_awaited_once()
+
+
+async def test_short_ambient_session_is_discarded() -> None:
+    """Ambient sessions below the ten-minute threshold do not become listens."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._ambient_sessions = {}
+    provider._last_counted = {}
+    provider._weather_snapshot = AsyncMock(return_value={})
+    provider._push = AsyncMock(return_value=True)
+    provider.mass = SimpleNamespace(player_queues=SimpleNamespace(get=lambda _: None))
+    provider.logger = MagicMock()
+    report = SimpleNamespace(
+        player_id="player-one",
+        uri="ambient_sounds://sound_effect/rain",
+        name="Rain",
+        seconds_played=599,
+        is_playing=False,
+    )
+
+    await provider._handle_ambient_report(report)
+
+    provider._push.assert_not_awaited()
 
 
 def test_hass_weather_state_maps_to_ingest_schema_and_converts_units() -> None:

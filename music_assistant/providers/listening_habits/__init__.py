@@ -30,7 +30,13 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
-from music_assistant_models.enums import ConfigEntryType, EventType, MediaType, ProviderFeature
+from music_assistant_models.enums import (
+    ConfigEntryType,
+    EventType,
+    MediaType,
+    PlaybackState,
+    ProviderFeature,
+)
 from music_assistant_models.streamdetails import StreamMetadata
 
 from music_assistant.controllers.streams.constants import (
@@ -103,6 +109,7 @@ ON_AIR_TIMEOUT_S = 10
 STREAM_METADATA_INTERVAL_S = 5
 PLAYLIST_TIMEOUT_S = 10
 PLAYLIST_CACHE_S = 10
+AMBIENT_SESSION_MIN_S = 10 * 60
 
 # Keys this provider owns inside StreamDetails.data, namespaced because the
 # dict is shared with Music Assistant's own in-band title handoff.
@@ -114,7 +121,7 @@ SUPPORTED_FEATURES: set[ProviderFeature] = set()
 
 # Radio is logged as well as tracks -- a station play is a listen. Anything
 # else (audiobook, podcast) is out of scope for this log for now.
-SUPPORTED_MEDIA_TYPES = frozenset({MediaType.TRACK, MediaType.RADIO})
+SUPPORTED_MEDIA_TYPES = frozenset({MediaType.TRACK, MediaType.RADIO, MediaType.SOUND_EFFECT})
 
 
 async def setup(
@@ -141,6 +148,9 @@ class ListeningHabitsProvider(PluginProvider):
         self._retry_task: asyncio.Task[None] | None = None
         # player_id -> uri of the last play counted for it; see _should_log.
         self._last_counted: dict[str, str] = {}
+        # (player_id, uri) -> start time, last elapsed value and the weather
+        # observed when the ambient session began.
+        self._ambient_sessions: dict[tuple[str, str], dict[str, Any]] = {}
         # What the Now Playing indicator reports. Held in memory only: it
         # describes this run of the provider, and a restart genuinely has
         # nothing to say about pushes it did not make. The backlog on disk is
@@ -442,6 +452,18 @@ class ListeningHabitsProvider(PluginProvider):
         if report.media_type not in SUPPORTED_MEDIA_TYPES:
             self.logger.debug("skipped: unsupported media type %s", report.media_type)
             return
+        cfg = self._scrobbler_config
+        if cfg.mass_userids and report.userid not in cfg.mass_userids:
+            self.logger.debug("skipped: user %s not in configured users", report.userid)
+            return
+        if cfg.mass_playerids and report.player_id not in cfg.mass_playerids:
+            self.logger.debug("skipped: player %s not in configured players", report.player_id)
+            return
+
+        if report.media_type is MediaType.SOUND_EFFECT:
+            await self._handle_ambient_report(report)
+            return
+
         if not self._should_log(report):
             self.logger.debug(
                 "skipped: %s (fully_played=%s, is_playing=%s)",
@@ -449,13 +471,6 @@ class ListeningHabitsProvider(PluginProvider):
                 report.fully_played,
                 report.is_playing,
             )
-            return
-        cfg = self._scrobbler_config
-        if cfg.mass_userids and report.userid not in cfg.mass_userids:
-            self.logger.debug("skipped: user %s not in configured users", report.userid)
-            return
-        if cfg.mass_playerids and report.player_id not in cfg.mass_playerids:
-            self.logger.debug("skipped: player %s not in configured players", report.player_id)
             return
 
         payload = self._build_payload(report)
@@ -480,9 +495,18 @@ class ListeningHabitsProvider(PluginProvider):
     # payload
     # ------------------------------------------------------------------
 
-    def _build_payload(self, report: MediaItemPlaybackProgressReport) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        report: MediaItemPlaybackProgressReport,
+        *,
+        played_at: datetime | None = None,
+        duration_s: int | None = None,
+        source_type: str | None = None,
+        artist: str | None = None,
+        client_ref_prefix: str = "ma",
+    ) -> dict[str, Any]:
         """Map a playback report onto the log server's schema."""
-        played_at = datetime.now(tz=UTC).astimezone()
+        played_at = (played_at or datetime.now(tz=UTC)).astimezone()
         streamdetails: StreamDetails | None = self._quality.recall(report.uri)
         audio_format = streamdetails.audio_format if streamdetails else None
         # MA's own notion of lossless, rather than a hardcoded codec list.
@@ -500,12 +524,13 @@ class ListeningHabitsProvider(PluginProvider):
             "played_at": int(played_at.timestamp()),
             "played_at_local": played_at.isoformat(timespec="seconds"),
             "tz_offset_minutes": int((played_at.utcoffset() or timedelta(0)).total_seconds() // 60),
-            "artist": report.artist,
+            "artist": artist or report.artist,
             "title": title,
             "album": report.album,
-            "duration_s": report.duration,
+            "duration_s": duration_s if duration_s is not None else report.duration,
             "artwork_url": report.image_url,
-            "source_type": "radio" if report.media_type is MediaType.RADIO else "streaming",
+            "source_type": source_type
+            or ("radio" if report.media_type is MediaType.RADIO else "streaming"),
             # The actual streaming service, not the string "Music Assistant" --
             # this is what collapsed every row to one provider before.
             "source_provider": self._describe_source_provider(
@@ -540,9 +565,65 @@ class ListeningHabitsProvider(PluginProvider):
             # Namespaced distinctly from the apps' "lh:" and the poller's
             # per-station refs, so a retry from here is never mistaken for a
             # play some other ingest already reported.
-            "client_ref": f"ma:{report.player_id}:{int(played_at.timestamp())}",
+            "client_ref": f"{client_ref_prefix}:{report.player_id}:{int(played_at.timestamp())}",
             "ingest_method": "music_assistant",
         }
+
+    async def _handle_ambient_report(self, report: MediaItemPlaybackProgressReport) -> None:
+        """Track an ambient sound and log one row when its session ends."""
+        player_id = report.player_id or ""
+        key = (player_id, report.uri)
+        elapsed = max(0, int(report.seconds_played or 0))
+        now = datetime.now(tz=UTC)
+        session = self._ambient_sessions.get(key)
+
+        if session is None:
+            session = {
+                "started_at": now - timedelta(seconds=elapsed),
+                "elapsed": elapsed,
+                "weather": await self._weather_snapshot(),
+            }
+            self._ambient_sessions[key] = session
+        else:
+            session["elapsed"] = max(int(session["elapsed"]), elapsed)
+
+        if report.is_playing:
+            # A fresh progress event re-arms the same URI for a later session.
+            if self._last_counted.get(player_id) == report.uri:
+                del self._last_counted[player_id]
+            return
+
+        queue = self.mass.player_queues.get(player_id)
+        if queue is not None and queue.state is PlaybackState.PAUSED:
+            return
+
+        self._ambient_sessions.pop(key, None)
+        elapsed = max(elapsed, int(session["elapsed"]))
+        if elapsed < AMBIENT_SESSION_MIN_S:
+            self.logger.debug(
+                "skipped ambient session shorter than %ss: %s (%ss)",
+                AMBIENT_SESSION_MIN_S,
+                report.name,
+                elapsed,
+            )
+            return
+        if self._last_counted.get(player_id) == report.uri:
+            return
+        self._last_counted[player_id] = report.uri
+
+        payload = self._build_payload(
+            report,
+            played_at=session["started_at"],
+            duration_s=elapsed,
+            source_type="ambient",
+            artist="Ambient Sounds",
+            client_ref_prefix="ma-ambient",
+        )
+        payload.update(session["weather"])
+        if await self._push(payload):
+            await self._backlog.drain(self._push)
+        else:
+            await self._backlog.append(payload)
 
     async def _weather_snapshot(self) -> dict[str, Any]:
         """Return a cached best-effort observation from HA, then Open-Meteo."""
