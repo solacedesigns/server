@@ -144,11 +144,15 @@ LAST_VERBATIM_KEY = "listening_habits_verbatim_title"
 
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
 
-# Radio, podcast episodes and ambient sounds are listens too. Audiobooks stay
-# out of scope until they have session-style logging rather than one very long
-# completion-only row.
+# Radio, podcast episodes, audiobooks and ambient sounds are listens too.
 SUPPORTED_MEDIA_TYPES = frozenset(
-    {MediaType.TRACK, MediaType.RADIO, MediaType.PODCAST_EPISODE, MediaType.SOUND_EFFECT}
+    {
+        MediaType.TRACK,
+        MediaType.RADIO,
+        MediaType.PODCAST_EPISODE,
+        MediaType.AUDIOBOOK,
+        MediaType.SOUND_EFFECT,
+    }
 )
 
 
@@ -566,6 +570,8 @@ class ListeningHabitsProvider(PluginProvider):
                 if report.media_type is MediaType.RADIO
                 else "podcast"
                 if report.media_type is MediaType.PODCAST_EPISODE
+                else "audiobook"
+                if report.media_type is MediaType.AUDIOBOOK
                 else "streaming"
             ),
             # The actual streaming service, not the string "Music Assistant" --

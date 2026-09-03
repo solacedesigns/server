@@ -27,6 +27,7 @@ from music_assistant_models.errors import (
 from music_assistant_models.media_items import (
     Album,
     Artist,
+    Audiobook,
     ItemMapping,
     MediaItemType,
     PodcastEpisode,
@@ -701,18 +702,26 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
 
         album: Album | ItemMapping | None = getattr(media_item, "album", None)
         podcast = media_item.podcast if isinstance(media_item, PodcastEpisode) else None
+        audiobook = media_item if isinstance(media_item, Audiobook) else None
         # signal 'media item played' event,
         # which is useful for plugins that want to do scrobbling
         artists: list[Artist | ItemMapping] = getattr(media_item, "artists", [])
         artists_names = [a.name for a in artists]
-        artist_name = (
-            podcast.name
-            if podcast
-            else (
-                getattr(media_item, "artist_str", None)
-                or (artists_names[0] if artists_names else None)
-            )
+        audiobook_authors = (
+            [author if isinstance(author, str) else author.name for author in audiobook.authors]
+            if audiobook
+            else []
         )
+        if podcast:
+            artist_name = podcast.name
+        elif audiobook:
+            artist_name = (
+                " / ".join(audiobook_authors) or audiobook.publisher or "Unknown Author"
+            )
+        else:
+            artist_name = getattr(media_item, "artist_str", None) or (
+                artists_names[0] if artists_names else None
+            )
         self.mass.signal_event(
             EventType.MEDIA_ITEM_PLAYED,
             object_id=media_item.uri,

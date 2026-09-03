@@ -45,6 +45,11 @@ def test_podcast_episodes_are_supported_listens() -> None:
     assert MediaType.PODCAST_EPISODE in SUPPORTED_MEDIA_TYPES
 
 
+def test_audiobooks_are_supported_listens() -> None:
+    """Completed audiobooks reach the Listening Habits ingest path."""
+    assert MediaType.AUDIOBOOK in SUPPORTED_MEDIA_TYPES
+
+
 def _playback_report(
     *, fully_played: bool, is_playing: bool, uri: str = "track://one"
 ) -> Any:
