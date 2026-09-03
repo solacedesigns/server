@@ -794,12 +794,12 @@ class ListeningHabitsProvider(PluginProvider):
         """Insert or update the single row for a podcast listening session."""
         payload = self._build_payload(
             report,
-            played_at=session["started_at"],
             duration_s=duration,
             source_type="podcast",
             client_ref_prefix="ma-podcast-session",
         )
         payload["client_ref"] = session["client_ref"]
+        payload["update_played_at"] = True
         payload.update(session["weather"])
         session["reported"] = duration
         if await self._push(payload):
