@@ -85,6 +85,38 @@ def test_restarted_track_rearms_completion_guard() -> None:
     assert provider._should_log(_playback_report(fully_played=True, is_playing=True))
 
 
+def test_marks_use_exact_play_ref_across_repeat_one_restart() -> None:
+    """A repeated queue item gets a new memory target after its time resets."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._current_plays = {}
+    provider._play_refs = {}
+    item = SimpleNamespace(
+        media_item=SimpleNamespace(uri="track://one", artist="Artist", name="Song"),
+        queue_item_id="queue-item-1",
+        streamdetails=None,
+    )
+    provider._remember_current_play("player-one", item, elapsed=44)
+    first = provider._current_plays["player-one"]["client_ref"]
+    provider.mass = SimpleNamespace(
+        player_queues=SimpleNamespace(get=lambda _: SimpleNamespace(current_item=item))
+    )
+
+    provider._on_queue_time_updated(SimpleNamespace(object_id="player-one", data=1))
+    second = provider._current_plays["player-one"]["client_ref"]
+
+    assert second != first
+    refs = provider._play_refs[("player-one", "track://one")]
+    assert [entry["client_ref"] for entry in refs] == [first, second]
+
+
+def test_marks_url_sits_alongside_ingest_endpoint() -> None:
+    """A mounted LHS instance keeps its sub-path for marks too."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._endpoint = "https://example.org/lhs/api/ingest"
+
+    assert provider._marks_url() == "https://example.org/lhs/api/marks"
+
+
 async def test_ambient_session_is_inserted_refreshed_and_finalized() -> None:
     """One ambient row appears at ten minutes and receives duration updates."""
     provider = object.__new__(ListeningHabitsProvider)

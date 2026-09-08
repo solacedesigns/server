@@ -53,6 +53,7 @@ from music_assistant.models.plugin import PluginProvider
 from .helpers import (
     DurableQueue,
     QualityCache,
+    api_root,
     device_type_from_model,
     guess_device_type_and_room,
     match_play,
@@ -99,6 +100,15 @@ WEATHER_TIMEOUT_S = 5
 ON_AIR_MIN_CACHE_S = 60
 ON_AIR_MAX_CACHE_S = 600
 ON_AIR_TIMEOUT_S = 10
+
+
+class MarksRequestError(RuntimeError):
+    """An error returned by the machine-authenticated LHS marks bridge."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 # Generic ICY radio reaches Music Assistant as a single "StreamTitle" string
 # and nothing else -- no album, no artwork, no duration. The station's own
@@ -205,6 +215,7 @@ class ListeningHabitsProvider(PluginProvider):
         # the part that must survive, and it does.
         self._unregister_api: Callable[[], None] | None = None
         self._unregister_on_air: Callable[[], None] | None = None
+        self._unregister_marks: list[Callable[[], None]] = []
         self._logged_total = 0
         self._session_started_at = int(datetime.now(UTC).timestamp())
         self._server_status_cache: tuple[float, dict[str, Any]] | None = None
@@ -225,6 +236,13 @@ class ListeningHabitsProvider(PluginProvider):
         self._weather_cache: tuple[float, dict[str, Any] | None] | None = None
         self._weather_retry_after = 0.0
         self._weather_source: str | None = None
+        # Queue-item sessions give a play a stable client_ref before it has
+        # crossed the completion threshold. That lets the now-playing memory
+        # button queue a mark against the exact play instead of guessing from
+        # artist/title.
+        self._current_plays: dict[str, dict[str, Any]] = {}
+        self._play_refs: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._pending_marks: dict[str, dict[str, Any]] = {}
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -275,6 +293,9 @@ class ListeningHabitsProvider(PluginProvider):
         await super().loaded_in_mass()
         self._on_unload.append(self.mass.subscribe(self._on_queue_updated, EventType.QUEUE_UPDATED))
         self._on_unload.append(
+            self.mass.subscribe(self._on_queue_time_updated, EventType.QUEUE_TIME_UPDATED)
+        )
+        self._on_unload.append(
             self.mass.subscribe(self._on_media_item_played, EventType.MEDIA_ITEM_PLAYED)
         )
         self._retry_task = self.mass.create_task(self._retry_loop())
@@ -286,6 +307,10 @@ class ListeningHabitsProvider(PluginProvider):
         self._unregister_on_air = self.mass.register_api_command(
             "listening_habits/on_air", self.get_on_air
         )
+        self._unregister_marks = [
+            self.mass.register_api_command("listening_habits/marks", self.get_marks),
+            self.mass.register_api_command("listening_habits/set_mark", self.set_mark),
+        ]
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unsubscribe and stop the retry loop."""
@@ -298,6 +323,9 @@ class ListeningHabitsProvider(PluginProvider):
         if self._unregister_on_air is not None:
             self._unregister_on_air()
             self._unregister_on_air = None
+        for unregister in getattr(self, "_unregister_marks", []):
+            unregister()
+        self._unregister_marks = []
         if self._retry_task and not self._retry_task.done():
             self._retry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -319,7 +347,95 @@ class ListeningHabitsProvider(PluginProvider):
             return
         if item.media_item and item.streamdetails:
             self._quality.remember(item.media_item.uri, item.streamdetails)
+        self._remember_current_play(event.object_id, item, elapsed=queue.elapsed_time)
         self._claim_stream_metadata(item)
+
+    def _on_queue_time_updated(self, event: MassEvent) -> None:
+        """Notice a restarted/repeated queue item before it gets logged."""
+        queue_id = str(event.object_id)
+        queue = self.mass.player_queues.get(queue_id)
+        if queue is None or (item := queue.current_item) is None:
+            return
+        elapsed = event.data if isinstance(event.data, (int, float)) else None
+        session = getattr(self, "_current_plays", {}).get(queue_id)
+        if session is None:
+            self._remember_current_play(queue_id, item, elapsed=elapsed)
+            return
+        item_key = str(getattr(item, "queue_item_id", None) or getattr(item.media_item, "uri", ""))
+        previous = session.get("last_elapsed")
+        if (
+            session.get("item_key") == item_key
+            and elapsed is not None
+            and previous is not None
+            and elapsed + 5 < previous
+        ):
+            # Repeat-one and a manual restart keep the same queue_item_id. A
+            # backwards time jump is the only signal that this is now a new
+            # play, so give it a fresh ref before the memory button is tapped.
+            self._remember_current_play(queue_id, item, elapsed=elapsed, force=True)
+            return
+        if session.get("item_key") == item_key and elapsed is not None:
+            session["last_elapsed"] = float(elapsed)
+        else:
+            self._remember_current_play(queue_id, item, elapsed=elapsed)
+
+    def _remember_current_play(
+        self,
+        queue_id: str,
+        item: QueueItem,
+        *,
+        elapsed: float | None = None,
+        force: bool = False,
+    ) -> None:
+        """Assign a stable client reference to the queue item currently playing."""
+        media = item.media_item
+        uri = getattr(media, "uri", None) or getattr(item, "uri", None)
+        if not uri:
+            return
+        queue_id = str(queue_id)
+        queue_item_id = getattr(item, "queue_item_id", None)
+        item_key = str(queue_item_id or uri)
+        current = getattr(self, "_current_plays", {}).get(queue_id)
+        if current and current["item_key"] == item_key and not force:
+            if elapsed is not None:
+                current["last_elapsed"] = float(elapsed)
+            return
+
+        stream_meta = getattr(getattr(item, "streamdetails", None), "stream_metadata", None)
+        session = {
+            "item_key": item_key,
+            "queue_item_id": str(queue_item_id) if queue_item_id else None,
+            "uri": str(uri),
+            "artist": getattr(stream_meta, "artist", None) or getattr(media, "artist", None),
+            "title": getattr(stream_meta, "title", None) or getattr(media, "name", None),
+            "media_type": getattr(media, "media_type", None),
+            "memory_supported": getattr(media, "media_type", None) is not MediaType.AUDIOBOOK,
+            "client_ref": f"ma:{queue_id}:{time.time_ns()}",
+            "last_elapsed": float(elapsed) if elapsed is not None else None,
+        }
+        if not hasattr(self, "_current_plays"):
+            self._current_plays = {}
+        if not hasattr(self, "_play_refs"):
+            self._play_refs = {}
+        self._current_plays[queue_id] = session
+        refs = self._play_refs.setdefault((queue_id, str(uri)), [])
+        refs.append(session)
+        # A player that is left running for days should not retain every
+        # replay of the same URI. The completion handler consumes the oldest
+        # reference first, preserving order when a queue repeats a track.
+        del refs[:-16]
+
+    def _take_play_ref(self, report: MediaItemPlaybackProgressReport) -> str | None:
+        """Take the oldest queued reference for a completed MA play."""
+        queue_id = str(report.player_id or "")
+        uri = str(report.uri or "")
+        refs = getattr(self, "_play_refs", {}).get((queue_id, uri))
+        if not refs:
+            return None
+        session = refs.pop(0)
+        if not refs:
+            self._play_refs.pop((queue_id, uri), None)
+        return str(session["client_ref"])
 
     # ------------------------------------------------------------------
     # stream metadata
@@ -532,7 +648,12 @@ class ListeningHabitsProvider(PluginProvider):
             )
             return
 
-        payload = self._build_payload(report)
+        client_ref = self._take_play_ref(report)
+        payload = (
+            self._build_payload(report, client_ref=client_ref)
+            if client_ref
+            else self._build_payload(report)
+        )
         payload.update(await self._weather_snapshot())
         if await self._push(payload):
             # Opportunistic drain: a push that just succeeded is good evidence
@@ -565,6 +686,7 @@ class ListeningHabitsProvider(PluginProvider):
         title: str | None = None,
         album: str | None = None,
         client_ref_prefix: str = "ma",
+        client_ref: str | None = None,
     ) -> dict[str, Any]:
         """Map a playback report onto the log server's schema."""
         played_at = (played_at or datetime.now(tz=UTC)).astimezone()
@@ -634,7 +756,8 @@ class ListeningHabitsProvider(PluginProvider):
             # Namespaced distinctly from the apps' "lh:" and the poller's
             # per-station refs, so a retry from here is never mistaken for a
             # play some other ingest already reported.
-            "client_ref": f"{client_ref_prefix}:{report.player_id}:{int(played_at.timestamp())}",
+            "client_ref": client_ref
+            or f"{client_ref_prefix}:{report.player_id}:{int(played_at.timestamp())}",
             "ingest_method": "music_assistant",
         }
 
@@ -733,7 +856,8 @@ class ListeningHabitsProvider(PluginProvider):
                 "reported": 0,
                 "persisted_listened": initial_listened,
                 "client_ref": (
-                    f"ma-podcast-session:{actor_id}:"
+                    self._current_client_ref(player_id, None)
+                    or f"ma-podcast-session:{actor_id}:"
                     f"{int(datetime.now(tz=UTC).timestamp())}"
                 ),
                 "weather": await self._weather_snapshot(),
@@ -900,6 +1024,10 @@ class ListeningHabitsProvider(PluginProvider):
                 "elapsed": segment_elapsed,
                 "segment_offset": 0,
                 "reported_elapsed": 0,
+                "client_ref": (
+                    self._current_client_ref(player_id, None)
+                    or f"ma-ambient:{player_id}:{int(now.timestamp())}"
+                ),
                 "weather": await self._weather_snapshot(),
             }
             self._ambient_sessions[key] = session
@@ -956,6 +1084,7 @@ class ListeningHabitsProvider(PluginProvider):
             source_type="ambient",
             artist="Ambient Sounds",
             client_ref_prefix="ma-ambient",
+            client_ref=session.get("client_ref"),
         )
         if not payload.get("artwork_url"):
             # Sound-effect providers commonly have a provider icon but no
@@ -1096,6 +1225,91 @@ class ListeningHabitsProvider(PluginProvider):
     # transport
     # ------------------------------------------------------------------
 
+    def _current_client_ref(
+        self, player_id: str | None, queue_item_id: str | None
+    ) -> str | None:
+        """Return the client reference for the active queue item, if known."""
+        if not player_id:
+            return None
+        player_key = str(player_id)
+        queue = self.mass.player_queues.get(player_key)
+        if queue is not None and (item := queue.current_item) is not None:
+            self._remember_current_play(player_key, item)
+        session = getattr(self, "_current_plays", {}).get(player_key)
+        if session is None:
+            return None
+        if queue_item_id and session.get("queue_item_id") != str(queue_item_id):
+            return None
+        return str(session["client_ref"])
+
+    def _current_memory_ref(
+        self, player_id: str | None, queue_item_id: str | None
+    ) -> str | None:
+        """Return a current ref only when this media type has a single listen row."""
+        client_ref = self._current_client_ref(player_id, queue_item_id)
+        if not client_ref or not player_id:
+            return None
+        session = getattr(self, "_current_plays", {}).get(str(player_id))
+        if session is None or not session.get("memory_supported", True):
+            return None
+        return client_ref
+
+    def _marks_url(self) -> str:
+        """Build the machine-authenticated marks URL from the ingest URL."""
+        return f"{api_root(self._endpoint)}/api/marks"
+
+    async def _marks_request(
+        self,
+        method: str,
+        *,
+        params: dict[str, str | None] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call the LHS marks bridge using the provider's private token."""
+        request = (
+            self.mass.http_session.get(
+                self._marks_url(),
+                params={key: value for key, value in (params or {}).items() if value is not None},
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=PUSH_TIMEOUT_S,
+            )
+            if method == "GET"
+            else self.mass.http_session.post(
+                self._marks_url(),
+                json=body or {},
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=PUSH_TIMEOUT_S,
+            )
+        )
+        async with request as response:
+            try:
+                payload = await response.json()
+            except Exception:
+                payload = {}
+            if response.status >= 400:
+                message = payload.get("error") if isinstance(payload, dict) else None
+                raise MarksRequestError(
+                    response.status, message or f"marks request failed ({response.status})"
+                )
+            if not isinstance(payload, dict):
+                raise RuntimeError("marks endpoint returned an invalid response")
+            return payload
+
+    async def _flush_pending_mark(self, client_ref: str) -> None:
+        """Apply a memory tapped before its completed listen reached LHS."""
+        pending = getattr(self, "_pending_marks", {}).get(client_ref)
+        if pending is None:
+            return
+        try:
+            await self._marks_request(
+                "POST",
+                body={**pending, "client_ref": client_ref},
+            )
+        except Exception as err:
+            self.logger.debug("Could not apply pending Listening Habits mark: %s", err)
+            return
+        self._pending_marks.pop(client_ref, None)
+
     async def _push(self, payload: dict[str, Any]) -> bool:
         """POST one payload. Returns True only if the server accepted it."""
         try:
@@ -1117,6 +1331,8 @@ class ListeningHabitsProvider(PluginProvider):
                         "title": payload.get("title"),
                         "at": datetime.now(UTC).timestamp(),
                     }
+                    if client_ref:
+                        await self._flush_pending_mark(str(client_ref))
                     return True
                 # An auth failure is a *configuration* error, not a bad
                 # payload: the play is perfectly good and will be accepted as
@@ -1228,6 +1444,91 @@ class ListeningHabitsProvider(PluginProvider):
             "weather_entity": self._weather_entity or None,
             "weather_source": self._weather_source,
         }
+
+    async def get_marks(
+        self,
+        artist: str,
+        title: str,
+        player_id: str | None = None,
+        queue_item_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the LHS marks for the song currently shown by MA."""
+        client_ref = self._current_client_ref(player_id, queue_item_id)
+        memory_ref = self._current_memory_ref(player_id, queue_item_id)
+        result = await self._marks_request(
+            "GET",
+            params={
+                "artist": artist,
+                "title": title,
+                "client_ref": client_ref,
+            },
+        )
+        if memory_ref:
+            # The row may not exist until the provider receives the completed
+            # play. It is still a valid current-play target, so let the UI
+            # offer memory and let _flush_pending_mark finish it after ingest.
+            result["memory_available"] = True
+            pending = getattr(self, "_pending_marks", {}).get(memory_ref)
+            if pending is not None:
+                result["memory"] = bool(pending["wanted"])
+                result["memory_pending"] = True
+        return result
+
+    async def set_mark(
+        self,
+        artist: str,
+        title: str,
+        kind: str,
+        wanted: bool,
+        player_id: str | None = None,
+        queue_item_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Set one LHS mark, preserving memory's exact-play identity."""
+        clean_kind = kind.strip().lower()
+        client_ref = self._current_client_ref(player_id, queue_item_id)
+        memory_ref = self._current_memory_ref(player_id, queue_item_id)
+        if clean_kind == "memory" and not memory_ref:
+            raise ValueError("This play is not available to mark as a memory yet")
+        if clean_kind == "memory":
+            assert memory_ref is not None
+        request_ref = memory_ref if clean_kind == "memory" else client_ref
+        body = {
+            "artist": artist,
+            "title": title,
+            "kind": clean_kind,
+            "wanted": wanted,
+            "client_ref": request_ref,
+        }
+        try:
+            result = await self._marks_request("POST", body=body)
+        except MarksRequestError as err:
+            # The completion event has not reached LHS yet. Keep the user's
+            # explicit choice in MA memory and apply it immediately after the
+            # normal ingest succeeds.
+            if clean_kind == "memory" and getattr(err, "status", None) == 404:
+                if wanted:
+                    self._pending_marks[memory_ref] = {
+                        "artist": artist,
+                        "title": title,
+                        "kind": "memory",
+                        "wanted": True,
+                    }
+                else:
+                    self._pending_marks.pop(memory_ref, None)
+                result = await self._marks_request(
+                    "GET",
+                    params={
+                        "artist": artist,
+                        "title": title,
+                        "client_ref": memory_ref,
+                    },
+                )
+                result["memory"] = bool(wanted)
+                result["memory_available"] = True
+                result["memory_pending"] = bool(wanted)
+            else:
+                raise
+        return result
 
     async def get_on_air(self, station: str | None = None) -> dict[str, Any] | None:
         """
