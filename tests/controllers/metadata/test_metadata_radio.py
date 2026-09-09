@@ -1,7 +1,7 @@
 """Tests for the RadioArtworkMixin name-matching helpers on MetaDataController."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from music_assistant_models.enums import ImageType, MediaType
@@ -194,6 +194,23 @@ class TestUpdateRadioStreamArtwork:
         streamdetails = self._streamdetails(self.FEED_ART)
         await self._controller(self.LOOKUP_ART).update_radio_stream_artwork(streamdetails)
         assert streamdetails.stream_metadata.image_url == self.FEED_ART
+
+    async def test_low_resolution_feed_artwork_prefers_the_catalog_cover(self) -> None:
+        """A small station thumbnail is replaced by a better catalog cover."""
+        streamdetails = self._streamdetails(self.FEED_ART)
+        ctrl = self._controller(self.LOOKUP_ART)
+        ctrl._is_low_resolution_artwork = AsyncMock(side_effect=[True, False])
+        await ctrl.update_radio_stream_artwork(streamdetails)
+        assert streamdetails.stream_metadata.image_url == self.LOOKUP_ART
+
+    async def test_low_resolution_feed_artwork_is_upconverted_without_a_lookup(self) -> None:
+        """A small feed image still gets a consistent 512px proxy when no cover is found."""
+        streamdetails = self._streamdetails(self.FEED_ART)
+        ctrl = self._controller(None)
+        ctrl._is_low_resolution_artwork = AsyncMock(return_value=True)
+        ctrl.get_image_url = MagicMock(return_value="https://ma.example/imageproxy/upscaled")
+        await ctrl.update_radio_stream_artwork(streamdetails)
+        assert streamdetails.stream_metadata.image_url == "https://ma.example/imageproxy/upscaled"
 
     async def test_feed_artwork_survives_a_lookup_miss(self) -> None:
         """A lookup that finds nothing leaves the feed's artwork alone."""

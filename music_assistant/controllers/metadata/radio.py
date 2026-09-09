@@ -8,7 +8,9 @@ metadata against the local library and MusicBrainz/online metadata providers.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
+from io import BytesIO
 from time import time
 from typing import TYPE_CHECKING, Any, cast
 
@@ -30,8 +32,10 @@ from music_assistant_models.media_items import (
     Track,
 )
 from music_assistant_models.unique_list import UniqueList
+from PIL import Image, UnidentifiedImageError
 
 from music_assistant.helpers.compare import compare_strings
+from music_assistant.helpers.images import get_image_data, is_svg_data
 from music_assistant.helpers.tags import split_artists
 from music_assistant.helpers.util import parse_title_and_version
 
@@ -42,6 +46,9 @@ from .constants import (
     CACHE_EXPIRATION_RADIO_ARTWORK_MISS,
     CONF_ENABLE_RADIO_METADATA_LOOKUP,
 )
+
+RADIO_ARTWORK_TARGET_SIZE = 512
+RADIO_ARTWORK_IMAGE_PROVIDER = "radio_artwork"
 
 if TYPE_CHECKING:
     import logging
@@ -410,6 +417,11 @@ class RadioArtworkMixin:
                 fallback_image_url=fallback_url,
                 album_name=album,
             )
+            feed_is_low_resolution = await self._is_low_resolution_artwork(fallback_url)
+            lookup_found = bool(image_url and image_url != fallback_url)
+            lookup_is_low_resolution = (
+                await self._is_low_resolution_artwork(image_url) if lookup_found else False
+            )
             # Use corrected artist/track if metadata was swapped
             final_artist = corrected_artist or original_artist
             final_title = corrected_track or original_title
@@ -418,8 +430,18 @@ class RadioArtworkMixin:
             # The lookup above matches on artist and track name alone, so it can
             # land on a different edition or a compilation -- a plausible cover
             # for the right song, but not the one on air. Prefer what the feed
-            # said and let the lookup fill the gap when it said nothing.
-            final_image_url = fallback_url or image_url
+            # said and let the lookup fill the gap when it said nothing. A small
+            # station thumbnail is the exception: it is often only a 300px channel
+            # logo or compressed now-playing image, while the catalog lookup has the
+            # full cover art. If the lookup also misses, proxy the feed image at the
+            # same 512px target used for regular queue artwork.
+            final_image_url = image_url if lookup_found and feed_is_low_resolution else fallback_url
+            final_image_url = final_image_url or image_url
+            if final_image_url and (
+                (not lookup_found and feed_is_low_resolution)
+                or (lookup_found and lookup_is_low_resolution)
+            ):
+                final_image_url = self._upconvert_radio_artwork(final_image_url)
             if (
                 final_image_url != fallback_url
                 or final_artist != original_artist
@@ -441,6 +463,50 @@ class RadioArtworkMixin:
                     self.mass.player_queues.signal_update(streamdetails.queue_id)
         except MusicAssistantError:
             pass
+
+    async def _is_low_resolution_artwork(self, image_url: str | None) -> bool:
+        """
+        Return whether a radio artwork source is smaller than the player target.
+
+        A failed probe is treated as unknown rather than low resolution so a
+        station's exact now-playing artwork is never replaced merely because its
+        CDN is temporarily unavailable.
+
+        :param image_url: Remote or imageproxy URL to inspect.
+        """
+        if not image_url:
+            return False
+        try:
+            image_data = await get_image_data(self.mass, image_url, RADIO_ARTWORK_IMAGE_PROVIDER)
+            dimensions = await asyncio.to_thread(self._get_image_dimensions, image_data)
+        except (AttributeError, FileNotFoundError, MusicAssistantError, OSError):
+            return False
+        if dimensions is None:
+            return False
+        return min(dimensions) < RADIO_ARTWORK_TARGET_SIZE
+
+    @staticmethod
+    def _get_image_dimensions(image_data: bytes) -> tuple[int, int] | None:
+        """Return raster artwork dimensions, or ``None`` for vector/unknown data."""
+        if is_svg_data(image_data):
+            return None
+        try:
+            with Image.open(BytesIO(image_data)) as image:
+                return image.size
+        except (UnidentifiedImageError, OSError):
+            return None
+
+    def _upconvert_radio_artwork(self, image_url: str) -> str:
+        """Return a 512px imageproxy URL for a small radio artwork source."""
+        return self.get_image_url(
+            MediaItemImage(
+                type=ImageType.THUMB,
+                path=image_url,
+                provider=RADIO_ARTWORK_IMAGE_PROVIDER,
+                remotely_accessible=True,
+            ),
+            size=RADIO_ARTWORK_TARGET_SIZE,
+        )
 
     @staticmethod
     def _prioritize_release_groups(
