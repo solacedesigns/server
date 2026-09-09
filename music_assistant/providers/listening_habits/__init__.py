@@ -154,6 +154,7 @@ PODCAST_SESSION_UPDATE_THRESHOLDS_S = tuple(
 # Keys this provider owns inside StreamDetails.data, namespaced because the
 # dict is shared with Music Assistant's own in-band title handoff.
 STATION_SLUG_KEY = "listening_habits_station"
+STATION_NAME_KEY = "listening_habits_station_name"
 LAST_MATCHED_KEY = "listening_habits_matched_title"
 LAST_VERBATIM_KEY = "listening_habits_verbatim_title"
 
@@ -215,6 +216,7 @@ class ListeningHabitsProvider(PluginProvider):
         # the part that must survive, and it does.
         self._unregister_api: Callable[[], None] | None = None
         self._unregister_on_air: Callable[[], None] | None = None
+        self._unregister_stats: Callable[[], None] | None = None
         self._unregister_marks: list[Callable[[], None]] = []
         self._logged_total = 0
         self._session_started_at = int(datetime.now(UTC).timestamp())
@@ -307,6 +309,9 @@ class ListeningHabitsProvider(PluginProvider):
         self._unregister_on_air = self.mass.register_api_command(
             "listening_habits/on_air", self.get_on_air
         )
+        self._unregister_stats = self.mass.register_api_command(
+            "listening_habits/stats", self.get_stats
+        )
         self._unregister_marks = [
             self.mass.register_api_command("listening_habits/marks", self.get_marks),
             self.mass.register_api_command("listening_habits/set_mark", self.set_mark),
@@ -323,6 +328,9 @@ class ListeningHabitsProvider(PluginProvider):
         if self._unregister_on_air is not None:
             self._unregister_on_air()
             self._unregister_on_air = None
+        if self._unregister_stats is not None:
+            self._unregister_stats()
+            self._unregister_stats = None
         for unregister in getattr(self, "_unregister_marks", []):
             unregister()
         self._unregister_marks = []
@@ -476,6 +484,7 @@ class ListeningHabitsProvider(PluginProvider):
         # than writing stream_metadata itself. Without it both would write.
         data[STREAMDETAILS_INBAND_TITLE_HANDOFF_KEY] = True
         data[STATION_SLUG_KEY] = slug
+        data[STATION_NAME_KEY] = station
         streamdetails.data = data
         streamdetails.stream_metadata_update_callback = self._update_stream_metadata
         streamdetails.stream_metadata_update_interval = STREAM_METADATA_INTERVAL_S
@@ -697,6 +706,19 @@ class ListeningHabitsProvider(PluginProvider):
         # Live stream metadata -- the show/DJ data a Home Assistant entity
         # simply does not carry, so these were always null before.
         stream_meta = streamdetails.stream_metadata if streamdetails else None
+        station_name = None
+        if report.media_type is MediaType.RADIO and streamdetails and streamdetails.data:
+            station_name = (
+                streamdetails.data.get(STATION_NAME_KEY)
+                or streamdetails.data.get("station")
+                or streamdetails.data.get("source_name")
+            )
+        if report.media_type is MediaType.RADIO and not station_name:
+            # A provider-owned radio stream may not let this plugin claim its
+            # metadata callback. The radio media item itself still carries the
+            # stable station name, which is a better source_name than the
+            # track album that stream_metadata may contain.
+            station_name = str(report.name or "").strip() or None
 
         device_type, room, device_name = self._describe_player(report.player_id)
         resolved_title = title or report.name
@@ -727,7 +749,13 @@ class ListeningHabitsProvider(PluginProvider):
             "source_provider": self._describe_source_provider(
                 streamdetails.provider if streamdetails else None
             ),
-            "source_name": stream_meta.album if stream_meta else None,
+            # Radio's stream metadata uses album for the track's album. The
+            # station name is carried in our namespaced streamdetails data so
+            # radio detail pages can aggregate by station rather than by the
+            # album that happened to be on air.
+            "source_name": station_name
+            if report.media_type is MediaType.RADIO
+            else (stream_meta.album if stream_meta else None),
             "source_app": "Music Assistant",
             "source_uri": report.uri,
             "show_name": stream_meta.title if stream_meta else None,
@@ -1529,6 +1557,66 @@ class ListeningHabitsProvider(PluginProvider):
             else:
                 raise
         return result
+
+    async def _stats_request(self, params: dict[str, str]) -> dict[str, Any]:
+        """Read one entity's aggregate from the private Listening Habits API."""
+        if not self._endpoint or not self._token:
+            return {"found": False}
+        try:
+            async with self.mass.http_session.get(
+                f"{api_root(self._endpoint)}/api/detail",
+                params=params,
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=PUSH_TIMEOUT_S,
+            ) as response:
+                try:
+                    payload = await response.json()
+                except Exception:
+                    payload = {}
+                if response.status >= 400:
+                    message = payload.get("error") if isinstance(payload, dict) else None
+                    raise RuntimeError(
+                        message or f"stats request failed ({response.status})"
+                    )
+                if not isinstance(payload, dict):
+                    raise RuntimeError("stats endpoint returned an invalid response")
+                return payload
+        except Exception as err:
+            # Detail pages are decoration. A temporary log-server failure must
+            # never interfere with playback or make the MA page unusable.
+            self.logger.debug("Could not read Listening Habits stats: %s", err)
+            return {"found": False}
+
+    async def get_stats(
+        self,
+        kind: str,
+        artist: str | None = None,
+        title: str | None = None,
+        album: str | None = None,
+        station: str | None = None,
+    ) -> dict[str, Any]:
+        """Return first/last/count stats for an MA detail-page entity."""
+        clean_kind = str(kind or "").strip().lower()
+        if clean_kind not in {"track", "album", "artist", "radio"}:
+            raise ValueError("stats kind must be track, album, artist, or radio")
+        params: dict[str, str] = {"kind": clean_kind}
+        if clean_kind == "radio":
+            if not station or not str(station).strip():
+                raise ValueError("radio stats need a station")
+            params["source_name"] = str(station).strip()
+        else:
+            if not artist or not str(artist).strip():
+                raise ValueError(f"{clean_kind} stats need an artist")
+            params["artist"] = str(artist).strip()
+            if clean_kind == "track":
+                if not title or not str(title).strip():
+                    raise ValueError("track stats need a title")
+                params["title"] = str(title).strip()
+            elif clean_kind == "album":
+                if not album or not str(album).strip():
+                    raise ValueError("album stats need an album")
+                params["album"] = str(album).strip()
+        return await self._stats_request(params)
 
     async def get_on_air(self, station: str | None = None) -> dict[str, Any] | None:
         """
