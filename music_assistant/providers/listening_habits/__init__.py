@@ -1340,6 +1340,19 @@ class ListeningHabitsProvider(PluginProvider):
 
     async def _push(self, payload: dict[str, Any]) -> bool:
         """POST one payload. Returns True only if the server accepted it."""
+        # A radio queue can briefly emit the station item itself before its
+        # stream metadata resolves to a song.  That snapshot has a useful
+        # source/station name but no artist, so it is not a listen and cannot
+        # satisfy the log server's required artist/title contract.  Drop it
+        # before HTTP rather than turning a harmless metadata gap into a red
+        # 422 status and a misleading failed-listen counter.
+        if not str(payload.get("artist") or "").strip() or not str(payload.get("title") or "").strip():
+            self.logger.debug(
+                "skipped incomplete Listening Habits payload: %s - %s",
+                payload.get("artist"),
+                payload.get("title"),
+            )
+            return True
         try:
             async with self.mass.http_session.post(
                 self._endpoint,
