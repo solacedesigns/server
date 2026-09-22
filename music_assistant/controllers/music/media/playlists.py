@@ -887,6 +887,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
         # actually add the tracks to the playlist on the provider
         update_current_task_progress(90, f"Adding {len(ids_to_add)} item(s) to playlist")
         await playlist_prov.add_playlist_tracks(playlist_prov_item_id, ids_to_add)
+        await self._refresh_playlist_track_cache(playlist_prov, playlist_prov_item_id)
         # reset 'last_refresh' to force a refresh of the playlist's metadata
         # in the next scheduled run of the playlist metadata task
         playlist.metadata.last_refresh = None
@@ -914,10 +915,27 @@ class PlaylistController(MediaControllerBase[Playlist]):
             msg = f"Provider {provider.name} does not support editing playlists"
             raise InvalidDataError(msg)
         await provider.remove_playlist_tracks(playlist_prov_item_id, positions_to_remove)
+        await self._refresh_playlist_track_cache(provider, playlist_prov_item_id)
         # reset 'last_refresh' to force a refresh of the playlist's metadata
         # in the next scheduled run of the playlist metadata task
         playlist.metadata.last_refresh = None
         await self.update_item_in_library(db_playlist_id, playlist)
+
+    async def _refresh_playlist_track_cache(
+        self, provider: MusicProvider, provider_playlist_id: str
+    ) -> None:
+        """Refresh the first page of a changed provider playlist."""
+        try:
+            async with self.mass.cache.handle_refresh(True):
+                await provider.get_playlist_tracks(provider_playlist_id, page=0)
+        except Exception as err:
+            self.logger.warning(
+                "Unable to refresh playlist tracks for %s on %s: %s",
+                provider_playlist_id,
+                provider.instance_id,
+                err,
+                exc_info=err if self.logger.isEnabledFor(10) else None,
+            )
 
     def _parse_summary_row(self, db_row: Mapping[str, Any]) -> PlaylistSummary:
         """Parse a raw summary db row into a PlaylistSummary object."""

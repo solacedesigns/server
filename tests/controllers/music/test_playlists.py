@@ -8,9 +8,12 @@ playlist's ``translation_key`` survives the library round-trip.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 from music_assistant_models.media_items import Playlist, ProviderMapping
 
+from music_assistant.controllers.cache.constants import BYPASS_CACHE
 from music_assistant.controllers.music.media.playlists import PlaylistController
 from music_assistant.mass import MusicAssistant
 
@@ -92,3 +95,21 @@ class TestPlaylistTranslationKey:
         )
         fetched = await playlist_ctrl.get_library_item(int(created.item_id))
         assert fetched.translation_key == "recently_played"
+
+
+async def test_refresh_playlist_track_cache_bypasses_provider_cache(
+    playlist_ctrl: PlaylistController,
+) -> None:
+    """Refresh playlist page zero without returning the provider's stale cache entry."""
+    provider = Mock(instance_id="tidal")
+
+    async def get_playlist_tracks(*args: object, **kwargs: object) -> list[object]:
+        assert BYPASS_CACHE.get()
+        return []
+
+    provider.get_playlist_tracks = AsyncMock(side_effect=get_playlist_tracks)
+
+    await playlist_ctrl._refresh_playlist_track_cache(provider, "playlist-id")
+
+    provider.get_playlist_tracks.assert_awaited_once_with("playlist-id", page=0)
+    assert not BYPASS_CACHE.get()
