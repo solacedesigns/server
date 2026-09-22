@@ -426,7 +426,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
 
         async with self._setlistfm_throttler:
             async with self.mass.http_session.get(
-                f"https://api.setlist.fm/1.0/setlist/{setlist_id_match.group(1)}",
+                f"https://api.setlist.fm/rest/1.0/setlist/{setlist_id_match.group(1)}",
                 headers={"x-api-key": api_key.strip(), "Accept": "application/json"},
                 timeout=15,
             ) as response:
