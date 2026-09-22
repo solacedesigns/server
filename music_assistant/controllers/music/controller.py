@@ -68,6 +68,7 @@ from music_assistant.controllers.music.constants import (
     CACHE_CATEGORY_SEARCH_RESULTS,
     CONF_DELETED_PROVIDERS,
     CONF_RESET_DB,
+    CONF_SETLISTFM_API_KEY,
     CONF_TRACK_RECONCILIATION_CURSOR,
     CONF_TRACK_RECONCILIATION_RESCAN_DUE,
     DATABASE_CLEANUP_TASK_ID,
@@ -299,6 +300,11 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                 type=ConfigEntryType.ACTION,
                 category="generic",
                 advanced=True,
+            ),
+            ConfigEntry(
+                key=CONF_SETLISTFM_API_KEY,
+                type=ConfigEntryType.SECURE_STRING,
+                required=False,
             ),
         )
 

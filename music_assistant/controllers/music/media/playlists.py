@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlsplit
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.enums import MediaType, ProviderFeature
@@ -18,6 +21,7 @@ from music_assistant_models.helpers import create_safe_string
 from music_assistant_models.media_items import Playlist, PlaylistSummary
 
 from music_assistant.constants import DB_TABLE_PLAYLISTS, PLAYLIST_MEDIA_TYPES, PlaylistPlayableItem
+from music_assistant.controllers.music.constants import CONF_SETLISTFM_API_KEY
 from music_assistant.controllers.tasks.context import (
     update_current_task_progress,
     update_current_task_progress_text,
@@ -31,6 +35,7 @@ from music_assistant.helpers.playlists import (
     media_item_to_playlist_item,
 )
 from music_assistant.helpers.security import is_safe_name
+from music_assistant.helpers.throttle_retry import Throttler
 from music_assistant.helpers.uri import create_uri, parse_uri
 from music_assistant.helpers.util import guard_single_request
 from music_assistant.models.music_provider import MusicProvider
@@ -105,6 +110,12 @@ class PlaylistController(MediaControllerBase[Playlist]):
             self.import_playlist,
             required_scope=Scope.LIBRARY_WRITE,
         )
+        self.mass.register_api_command(
+            "music/playlists/setlistfm_preview",
+            self.preview_setlistfm,
+            required_scope=Scope.LIBRARY_READ,
+        )
+        self._setlistfm_throttler = Throttler(rate_limit=1, period=1)
 
     @property
     def summary_query(self) -> tuple[str, dict[str, Any]]:
@@ -369,6 +380,141 @@ class PlaylistController(MediaControllerBase[Playlist]):
                 priority=True,
             )
         return db_playlist
+
+    async def preview_setlistfm(
+        self, url: str, provider_instance_id: str
+    ) -> dict[str, Any]:
+        """Fetch a Setlist.fm setlist and find tracks on the selected music provider.
+
+        :param url: Setlist.fm setlist URL.
+        :param provider_instance_id: Provider instance to search for matching tracks.
+        """
+        provider = self.mass.get_provider(provider_instance_id)
+        if not isinstance(provider, MusicProvider) or not provider.available:
+            raise ProviderUnavailableError(f"Music provider {provider_instance_id} is unavailable")
+        can_create_tracks = bool(
+            {
+                ProviderFeature.PLAYLIST_CREATE,
+                ProviderFeature.PLAYLIST_CREATE_TRACKS,
+            }
+            & provider.supported_features
+        )
+        if (
+            ProviderFeature.SEARCH not in provider.supported_features
+            or ProviderFeature.PLAYLIST_TRACKS_EDIT not in provider.supported_features
+            or not can_create_tracks
+        ):
+            msg = f"{provider.name} cannot search tracks and create editable playlists"
+            raise InvalidDataError(msg)
+
+        api_key = self.mass.music.get_config_value(CONF_SETLISTFM_API_KEY)
+        if not isinstance(api_key, str) or not api_key.strip():
+            msg = "Configure a Setlist.fm API key in Music Assistant's Music settings first"
+            raise InvalidDataError(msg)
+
+        parsed_url = urlsplit(url.strip())
+        if parsed_url.scheme != "https" or parsed_url.hostname not in {
+            "setlist.fm",
+            "www.setlist.fm",
+        }:
+            msg = "Enter a valid HTTPS Setlist.fm setlist URL"
+            raise InvalidDataError(msg)
+        setlist_id_match = re.search(r"-([0-9a-f]{8})\.html$", parsed_url.path, re.IGNORECASE)
+        if not setlist_id_match:
+            msg = "The URL does not contain a valid Setlist.fm setlist ID"
+            raise InvalidDataError(msg)
+
+        async with self._setlistfm_throttler:
+            async with self.mass.http_session.get(
+                f"https://api.setlist.fm/1.0/setlist/{setlist_id_match.group(1)}",
+                headers={"x-api-key": api_key.strip(), "Accept": "application/json"},
+                timeout=15,
+            ) as response:
+                if response.status == 404:
+                    msg = "Setlist.fm could not find that setlist"
+                    raise InvalidDataError(msg)
+                response.raise_for_status()
+                data = await response.json()
+
+        artist_name = str((data.get("artist") or {}).get("name") or "Unknown artist")
+        venue_name = str((data.get("venue") or {}).get("name") or "")
+        event_date = str(data.get("eventDate") or "")
+        setlist_sets = (data.get("sets") or {}).get("set") or []
+        if isinstance(setlist_sets, dict):
+            setlist_sets = [setlist_sets]
+        setlist_songs: list[tuple[str, str | None, str | None]] = []
+        for set_data in setlist_sets:
+            songs = set_data.get("song") or []
+            if isinstance(songs, dict):
+                songs = [songs]
+            for song in songs:
+                if song.get("tape") or not (song_name := str(song.get("name") or "").strip()):
+                    continue
+                cover_artist = (song.get("cover") or {}).get("name")
+                song_info = song.get("info")
+                setlist_songs.append(
+                    (song_name, str(song_info) if song_info else None, cover_artist)
+                )
+        if not setlist_songs:
+            msg = "No songs were listed in that Setlist.fm setlist"
+            raise InvalidDataError(msg)
+
+        async def find_matches(
+            song_name: str, info: str | None, cover_artist: str | None
+        ) -> dict[str, Any]:
+            query = f"{song_name} {cover_artist or artist_name}"
+            result = await provider.search(query, [MediaType.TRACK], limit=5)
+            candidates = [
+                {
+                    "uri": track.uri,
+                    "name": track.name,
+                    "artists": [artist.name for artist in track.artists],
+                    "album": track.album.name if track.album else None,
+                }
+                for track in result.tracks
+                if track.uri
+                and (
+                    track.provider in {provider.instance_id, provider.domain}
+                    or any(
+                        mapping.provider_instance == provider.instance_id
+                        for mapping in track.provider_mappings
+                    )
+                )
+            ]
+            return {
+                "name": song_name,
+                "info": info,
+                "cover_artist": cover_artist,
+                "candidates": candidates,
+            }
+
+        search_slots = asyncio.Semaphore(2)
+
+        async def throttled_search(
+            song_name: str, info: str | None, cover_artist: str | None
+        ) -> dict[str, Any]:
+            async with search_slots:
+                return await find_matches(song_name, info, cover_artist)
+
+        tracks = await asyncio.gather(
+            *(
+                throttled_search(name, info, cover_artist)
+                for name, info, cover_artist in setlist_songs
+            )
+        )
+        playlist_name_parts = [artist_name]
+        if event_date:
+            playlist_name_parts.append(event_date)
+        if venue_name:
+            playlist_name_parts.append(venue_name)
+        return {
+            "artist": artist_name,
+            "venue": venue_name,
+            "event_date": event_date,
+            "playlist_name": " - ".join(playlist_name_parts),
+            "provider_instance_id": provider.instance_id,
+            "tracks": tracks,
+        }
 
     def _verify_update_allowed(self, current_item: Playlist, update: Playlist) -> None:
         """

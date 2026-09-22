@@ -7,6 +7,10 @@
     "reset_db": {
       "label": "Reset library database",
       "description": "This will issue a full reset of the library database and trigger a full sync. Only use this option as a last resort if you are seeing issues with the library database."
+    },
+    "setlistfm_api_key": {
+      "label": "Setlist.fm API key",
+      "description": "API key used to retrieve Setlist.fm setlists for playlist creation."
     }
   },
   "config_actions": {

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Final
 
 CONF_RESET_DB = "reset_db"
+CONF_SETLISTFM_API_KEY = "setlistfm_api_key"
 DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
