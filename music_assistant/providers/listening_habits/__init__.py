@@ -62,6 +62,7 @@ from .helpers import (
     on_air_url,
     station_playlist_url,
 )
+from .vinyl_display import VinylDisplayBridge
 from .weather import snapshot_from_hass_state, snapshot_from_open_meteo
 
 if TYPE_CHECKING:
@@ -192,6 +193,7 @@ class ListeningHabitsProvider(PluginProvider):
         """Initialize."""
         super().__init__(mass, manifest, config, supported_features)
         self._on_unload: list[Callable[[], None]] = []
+        self._vinyl_display = VinylDisplayBridge(self)
         self._quality = QualityCache()
         self._retry_task: asyncio.Task[None] | None = None
         # player_id -> uri of the last play counted for it; see _should_log.
@@ -308,6 +310,11 @@ class ListeningHabitsProvider(PluginProvider):
         )
         self._unregister_on_air = self.mass.register_api_command(
             "listening_habits/on_air", self.get_on_air
+        )
+        self._on_unload.append(
+            self.mass.register_api_command(
+                "listening_habits/vinyl_now_playing", self._vinyl_display.get_state
+            )
         )
         self._unregister_stats = self.mass.register_api_command(
             "listening_habits/stats", self.get_stats
