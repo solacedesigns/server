@@ -93,11 +93,13 @@ class VinylBridgeTests(unittest.IsolatedAsyncioTestCase):
             config=MagicMock(),
             _endpoint="https://example.com/api/ingest",
             _token="test-only",
-            mass=SimpleNamespace(players=MagicMock(), http_session=MagicMock()),
+            mass=SimpleNamespace(
+                players=MagicMock(spec=["get_player_state"]), http_session=MagicMock()
+            ),
             logger=logging.getLogger(__name__),
         )
         self.provider.config.get_value.return_value = DEFAULT_VINYL_PLAYER_ID
-        self.provider.mass.players.get.return_value = self.player
+        self.provider.mass.players.get_player_state.return_value = self.player
         self.bridge = VinylDisplayBridge(self.provider)
 
     async def test_rejects_other_players_and_streaming(self) -> None:

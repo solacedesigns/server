@@ -85,7 +85,7 @@ class VinylDisplayBridge:
         return result if self._is_phono(player_id) else None
 
     def _is_phono(self, player_id: str) -> bool:
-        player = self.provider.mass.players.get(player_id)
+        player = self.provider.mass.players.get_player_state(player_id)
         if player is None or not player.available or player.powered is False:
             return False
         media = player.current_media
