@@ -10,15 +10,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
-from music_assistant_models.enums import MediaType, ProviderIconVariant
+from music_assistant_models.enums import MediaType, PlaybackState, ProviderIconVariant
 
 from music_assistant.providers.listening_habits import (
     AMBIENT_SESSION_RESUME_GRACE_S,
     AMBIENT_SESSION_UPDATE_THRESHOLDS_S,
     ListeningHabitsProvider,
+    STREAMDETAILS_INBAND_TITLE_KEY,
     SUPPORTED_MEDIA_TYPES,
 )
 from music_assistant.providers.listening_habits.helpers import (
@@ -30,12 +31,14 @@ from music_assistant.providers.listening_habits.helpers import (
     named_show,
     on_air_station_slug,
     on_air_url,
+    station_play_client_ref,
     station_playlist_url,
 )
 from music_assistant.providers.listening_habits.weather import (
     snapshot_from_hass_state,
     snapshot_from_open_meteo,
 )
+from music_assistant.providers.listening_habits.song_logging import SongListen
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -83,6 +86,123 @@ def test_restarted_track_rearms_completion_guard() -> None:
     assert provider._should_log(_playback_report(fully_played=True, is_playing=True))
     assert not provider._should_log(_playback_report(fully_played=False, is_playing=True))
     assert provider._should_log(_playback_report(fully_played=True, is_playing=True))
+
+
+async def test_radio_stream_metadata_logs_the_matched_feed_play_once() -> None:
+    """A live radio title becomes one exact station-feed listen, not a completion event."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._radio_log_inflight = set()
+    provider._quality = QualityCache()
+    provider._scrobbler_config = SimpleNamespace(mass_userids=(), mass_playerids=())
+    provider._current_plays = {
+        "player-one": {
+            "uri": "library://radio/1", "client_ref": "ma:provisional",
+            "radio_identity": "thecurrent:airing-1",
+            "radio_listen": SongListen(0, 0, True, 1788360000),
+        }
+    }
+    provider._weather_snapshot = AsyncMock(return_value={})
+    provider._build_payload = MagicMock(return_value={"show_name": "wrong", "dj_name": "wrong"})
+    provider._push = AsyncMock(return_value=True)
+    provider._backlog = SimpleNamespace(drain=AsyncMock(), append=AsyncMock())
+
+    streamdetails = SimpleNamespace(
+        queue_id="player-one",
+        data={
+            "listening_habits_station_name": "The Current",
+            STREAMDETAILS_INBAND_TITLE_KEY: "Noah Kahan - The Great Divide",
+            "listening_habits_matched_title": "Noah Kahan - The Great Divide",
+        },
+    )
+    queue_item = SimpleNamespace(
+        queue_item_id="radio-item",
+        media_item=SimpleNamespace(uri="library://radio/1"),
+        streamdetails=streamdetails,
+    )
+    queue = SimpleNamespace(state=PlaybackState.PLAYING, current_item=queue_item)
+    queue_data = SimpleNamespace(userid=None)
+    provider.mass = SimpleNamespace(
+        player_queues=SimpleNamespace(
+            get=lambda _: queue,
+            queue_data_or_none=lambda _: queue_data,
+        )
+    )
+
+    play = {
+        "play_id": "airing-1",
+        "artist": "Noah Kahan",
+        "title": "The Great Divide",
+        "album": "Cape Elizabeth",
+        "artwork_url": "https://example.test/cover.jpg",
+        "duration_s": 213,
+        "played_at": 1788360000,
+    }
+    await provider._log_radio_play(streamdetails, play, station_slug="the-current")
+    provider._push.assert_not_awaited()
+    provider._current_plays["player-one"]["radio_listen"].heard = 60
+    await provider._log_radio_play(streamdetails, play, station_slug="the-current")
+    await provider._log_radio_play(streamdetails, play, station_slug="the-current")
+
+    provider._push.assert_awaited_once()
+    payload = provider._push.await_args.args[0]
+    assert provider._build_payload.call_args.kwargs["client_ref"] == "thecurrent:airing-1"
+    assert provider._build_payload.call_args.kwargs["played_at"].timestamp() == 1788360000
+    assert payload["source_confidence"] == "exact"
+    assert payload["show_name"] is None
+    assert payload["dj_name"] is None
+    assert provider._current_plays["player-one"]["client_ref"] == "thecurrent:airing-1"
+
+
+async def test_radio_metadata_callback_logs_new_match_and_not_same_title_again() -> None:
+    """The callback is the radio boundary because MA never completes a live station item."""
+    provider = object.__new__(ListeningHabitsProvider)
+    provider._playlist_cache = {}
+    provider.logger = MagicMock()
+    provider._station_plays = AsyncMock(
+        return_value=[
+            {
+                "play_id": "airing-2",
+                "artist": "The Smashing Pumpkins",
+                "title": "Tonight, Tonight",
+                "album": "Mellon Collie and the Infinite Sadness",
+                "artwork_url": "https://example.test/pumpkins.jpg",
+                "duration_s": 255,
+                "played_at": 1788360001,
+            }
+        ]
+    )
+    provider._log_radio_play = AsyncMock()
+    details = SimpleNamespace(
+        data={
+            "listening_habits_station": "the-current",
+            "listening_habits_station_name": "The Current",
+            STREAMDETAILS_INBAND_TITLE_KEY: "Tonight Tonight-The Smashing Pumpkins",
+        },
+        stream_metadata=None,
+    )
+
+    await provider._update_stream_metadata(details, 0)
+    await provider._update_stream_metadata(details, 0)
+
+    provider._log_radio_play.assert_awaited_once_with(
+        details,
+        {
+            "play_id": "airing-2",
+            "artist": "The Smashing Pumpkins",
+            "title": "Tonight, Tonight",
+            "album": "Mellon Collie and the Infinite Sadness",
+            "artwork_url": "https://example.test/pumpkins.jpg",
+            "duration_s": 255,
+            "played_at": 1788360001,
+        },
+        station_slug="the-current",
+    )
+
+
+def test_station_play_client_ref_matches_the_current_poller() -> None:
+    """MA and the legacy station poller share one exact airing identity."""
+    assert station_play_client_ref("the-current", {"play_id": "123"}) == "thecurrent:123"
+    assert station_play_client_ref("the-current", {"client_ref": "thecurrent:123"}) == "thecurrent:123"
 
 
 def test_marks_use_exact_play_ref_across_repeat_one_restart() -> None:

@@ -297,6 +297,32 @@ def station_playlist_url(ingest_endpoint: str, slug: str, limit: int = 12) -> st
     return f"{api_root(ingest_endpoint)}/api/station-playlist?station={slug}&limit={limit}"
 
 
+def station_play_client_ref(station_slug: str, play: Mapping[str, Any]) -> str:
+    """Return the stable ingest reference for a station-feed play.
+
+    The Current poller uses ``thecurrent:<play_id>``. Keeping that same
+    identity lets the in-process MA logger and the older station poller merge
+    one airing instead of creating two listens when they overlap.
+
+    :param station_slug: Log-server station slug.
+    :param play: Station-play payload returned by the playlist route.
+    """
+    existing = play.get("client_ref")
+    if existing:
+        return str(existing)
+    play_id = play.get("play_id")
+    prefix = re.sub(r"[^a-z0-9]+", "", station_slug.lower()) or "radio"
+    if play_id:
+        return f"{prefix}:{play_id}"
+    # All supported feeds expose a play id. This fallback still gives a stable
+    # identity for a malformed response during one airing rather than falling
+    # back to the wall clock and duplicating it on every metadata refresh.
+    played_at = play.get("played_at") or "unknown"
+    artist = icy_match_key(str(play.get("artist") or ""))
+    title = icy_match_key(str(play.get("title") or ""))
+    return f"ma-radio:{prefix}:{played_at}:{artist}:{title}"
+
+
 # Show names that mean "the station is just on", rather than a programme worth
 # naming. The Current labels every hour of its ordinary rotation "The Current
 # Music", which says nothing the station name and the DJ do not already say.

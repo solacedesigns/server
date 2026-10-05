@@ -28,6 +28,7 @@ import json
 import os
 import time
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
@@ -60,13 +61,15 @@ from .helpers import (
     named_show,
     on_air_station_slug,
     on_air_url,
+    station_play_client_ref,
     station_playlist_url,
 )
+from .song_logging import SONG_LOG_THRESHOLD_S, SongListen
 from .vinyl_display import VinylDisplayBridge
 from .weather import snapshot_from_hass_state, snapshot_from_open_meteo
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.event import MassEvent
@@ -156,8 +159,11 @@ PODCAST_SESSION_UPDATE_THRESHOLDS_S = tuple(
 # dict is shared with Music Assistant's own in-band title handoff.
 STATION_SLUG_KEY = "listening_habits_station"
 STATION_NAME_KEY = "listening_habits_station_name"
+STATION_QUEUE_ID_KEY = "listening_habits_queue_id"
 LAST_MATCHED_KEY = "listening_habits_matched_title"
 LAST_VERBATIM_KEY = "listening_habits_verbatim_title"
+LAST_RADIO_PLAY_REF_KEY = "listening_habits_radio_play_ref"
+ACTIVE_RADIO_PLAY_KEY = "listening_habits_active_radio_play"
 
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
 
@@ -234,6 +240,9 @@ class ListeningHabitsProvider(PluginProvider):
         # title has no match yet, which is the window where the stream is ahead
         # of the feed and the same question gets asked every few seconds.
         self._playlist_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        # A metadata callback can overlap its previous network lookup. Keep
+        # one feed play from entering the ingest queue twice in that window.
+        self._radio_log_inflight: set[tuple[str, str]] = set()
         # Successful observations only. A failed refresh must not erase the
         # last known conditions, because they remain a useful fallback for a
         # short window (while retaining their original observed_at value).
@@ -295,6 +304,10 @@ class ListeningHabitsProvider(PluginProvider):
     async def loaded_in_mass(self) -> None:
         """Subscribe to playback events once the provider is live."""
         await super().loaded_in_mass()
+        self.logger.info(
+            "Song logging enabled after %s seconds of observed playback, including radio songs",
+            SONG_LOG_THRESHOLD_S,
+        )
         self._on_unload.append(self.mass.subscribe(self._on_queue_updated, EventType.QUEUE_UPDATED))
         self._on_unload.append(
             self.mass.subscribe(self._on_queue_time_updated, EventType.QUEUE_TIME_UPDATED)
@@ -364,6 +377,7 @@ class ListeningHabitsProvider(PluginProvider):
             self._quality.remember(item.media_item.uri, item.streamdetails)
         self._remember_current_play(event.object_id, item, elapsed=queue.elapsed_time)
         self._claim_stream_metadata(item)
+        self._observe_song(str(event.object_id), queue)
 
     def _on_queue_time_updated(self, event: MassEvent) -> None:
         """Notice a restarted/repeated queue item before it gets logged."""
@@ -375,6 +389,7 @@ class ListeningHabitsProvider(PluginProvider):
         session = getattr(self, "_current_plays", {}).get(queue_id)
         if session is None:
             self._remember_current_play(queue_id, item, elapsed=elapsed)
+            self._observe_song(queue_id, queue, elapsed=elapsed)
             return
         item_key = str(getattr(item, "queue_item_id", None) or getattr(item.media_item, "uri", ""))
         previous = session.get("last_elapsed")
@@ -388,11 +403,136 @@ class ListeningHabitsProvider(PluginProvider):
             # backwards time jump is the only signal that this is now a new
             # play, so give it a fresh ref before the memory button is tapped.
             self._remember_current_play(queue_id, item, elapsed=elapsed, force=True)
+            self._observe_song(queue_id, queue, elapsed=elapsed)
             return
         if session.get("item_key") == item_key and elapsed is not None:
             session["last_elapsed"] = float(elapsed)
         else:
             self._remember_current_play(queue_id, item, elapsed=elapsed)
+        self._observe_song(queue_id, queue, elapsed=elapsed)
+
+    def _observe_song(
+        self, queue_id: str, queue: Any, *, elapsed: float | None = None, wake: bool = True
+    ) -> None:
+        """Observe the active song and wake its qualified logging path."""
+        item = queue.current_item
+        session = self._current_plays.get(queue_id)
+        if item is None or session is None:
+            return
+        media_type = getattr(item.media_item, "media_type", None)
+        position = float(elapsed if elapsed is not None else getattr(queue, "elapsed_time", 0))
+        playing = getattr(queue, "state", None) is PlaybackState.PLAYING
+        now = time.monotonic()
+        if media_type is MediaType.TRACK:
+            listen = session.get("song_listen")
+            if listen is None:
+                listen = SongListen(position, now, playing, time.time())
+                session["song_listen"] = listen
+            else:
+                listen.observe(position, playing, now)
+            if wake and listen.due and (report := session.get("song_report")) is not None:
+                self.mass.create_task(self._log_track_play(report, session))
+            return
+        if media_type is not MediaType.RADIO or item.streamdetails is None:
+            return
+        details = item.streamdetails
+        data = details.data or {}
+        meta = details.stream_metadata
+        play = data.get(ACTIVE_RADIO_PLAY_KEY)
+        if data.get(STATION_SLUG_KEY):
+            if (
+                not play
+                or data.get(LAST_MATCHED_KEY) != data.get(STREAMDETAILS_INBAND_TITLE_KEY)
+            ):
+                session.pop("radio_listen", None)
+                session.pop("radio_identity", None)
+                return
+            identity = station_play_client_ref(str(data[STATION_SLUG_KEY]), play)
+        elif meta and meta.artist and meta.title:
+            identity = f"{session['uri']}:{meta.artist.casefold()}:{meta.title.casefold()}"
+        else:
+            session.pop("radio_listen", None)
+            session.pop("radio_identity", None)
+            return
+        listen = session.get("radio_listen")
+        if listen is None or session.get("radio_identity") != identity:
+            listen = SongListen(position, now, playing, time.time())
+            session["radio_listen"] = listen
+            session["radio_identity"] = identity
+            session["radio_client_ref"] = (
+                identity if play else f"ma-radio:{queue_id}:{time.time_ns()}"
+            )
+            session["client_ref"] = session["radio_client_ref"]
+        else:
+            listen.observe(position, playing, now)
+        if wake and listen.due and playing:
+            self.mass.create_task(self._log_observed_radio(queue_id, details, session))
+
+    async def _log_observed_radio(
+        self, queue_id: str, details: StreamDetails, session: dict[str, Any]
+    ) -> None:
+        """Publish the qualified current radio song without claiming metadata ownership."""
+        queue = self.mass.player_queues.get(queue_id)
+        if (
+            self.unloading
+            or queue is None
+            or queue.state is not PlaybackState.PLAYING
+            or queue.current_item is None
+            or queue.current_item.streamdetails is not details
+            or queue.current_item.media_item is None
+            or self._current_plays.get(queue_id) is not session
+        ):
+            return
+        data = details.data or {}
+        if (play := data.get(ACTIVE_RADIO_PLAY_KEY)) and data.get(STATION_SLUG_KEY):
+            await self._log_radio_play(details, play, station_slug=str(data[STATION_SLUG_KEY]))
+            return
+        meta = details.stream_metadata
+        if meta is None or not meta.artist or not meta.title:
+            return
+        identity = f"{session['uri']}:{meta.artist.casefold()}:{meta.title.casefold()}"
+        if identity != session.get("radio_identity"):
+            return
+        cfg = self._scrobbler_config
+        queue_data = self.mass.player_queues.queue_data_or_none(queue_id)
+        userid = queue_data.userid if queue_data else None
+        if (cfg.mass_userids and userid not in cfg.mass_userids) or (
+            cfg.mass_playerids and queue_id not in cfg.mass_playerids
+        ):
+            return
+        listen = session["radio_listen"]
+        if not listen.claim():
+            return
+        self._quality.remember(session["uri"], details)
+        report = SimpleNamespace(
+            player_id=queue_id,
+            uri=session["uri"],
+            media_type=MediaType.RADIO,
+            name=queue.current_item.media_item.name,
+            artist=meta.artist,
+            title=meta.title,
+            album=meta.album,
+            duration=meta.duration,
+            image_url=meta.image_url,
+            version=None,
+            mbid=None,
+            artist_mbids=None,
+            album_mbid=None,
+        )
+        payload = self._build_payload(
+            cast("MediaItemPlaybackProgressReport", report),
+            played_at=datetime.fromtimestamp(listen.started_at, tz=UTC),
+            artist=meta.artist,
+            title=meta.title,
+            client_ref=session["radio_client_ref"],
+        )
+        payload["show_name"] = None
+        payload["dj_name"] = None
+        payload.update(await self._weather_snapshot())
+        if await self._push(payload):
+            await self._backlog.drain(self._push)
+        else:
+            await self._backlog.append(payload)
 
     def _remember_current_play(
         self,
@@ -492,6 +632,9 @@ class ListeningHabitsProvider(PluginProvider):
         data[STREAMDETAILS_INBAND_TITLE_HANDOFF_KEY] = True
         data[STATION_SLUG_KEY] = slug
         data[STATION_NAME_KEY] = station
+        queue_id = getattr(item, "queue_id", None) or getattr(streamdetails, "queue_id", None)
+        if queue_id:
+            data[STATION_QUEUE_ID_KEY] = str(queue_id)
         streamdetails.data = data
         streamdetails.stream_metadata_update_callback = self._update_stream_metadata
         streamdetails.stream_metadata_update_interval = STREAM_METADATA_INTERVAL_S
@@ -530,6 +673,8 @@ class ListeningHabitsProvider(PluginProvider):
             # the station sends a different title.
             return
         play = match_play(icy_title, await self._station_plays(str(slug)))
+        if data.get(STREAMDETAILS_INBAND_TITLE_KEY) != icy_title:
+            return
         if play is None:
             # Write it once, then keep asking: a title the feed has not logged
             # yet is indistinguishable from a talk break until it appears.
@@ -539,6 +684,7 @@ class ListeningHabitsProvider(PluginProvider):
             return
         data.pop(LAST_VERBATIM_KEY, None)
         data[LAST_MATCHED_KEY] = icy_title
+        data[ACTIVE_RADIO_PLAY_KEY] = dict(play)
         duration = play.get("duration_s")
         streamdetails.stream_metadata = StreamMetadata(
             title=str(play.get("title") or icy_title),
@@ -550,6 +696,154 @@ class ListeningHabitsProvider(PluginProvider):
         self.logger.debug(
             "Stream metadata for %s: %s - %s", slug, play.get("artist"), play.get("title")
         )
+        await self._log_radio_play(streamdetails, play, station_slug=str(slug))
+
+    async def _log_radio_play(
+        self,
+        streamdetails: StreamDetails,
+        play: Mapping[str, Any],
+        *,
+        station_slug: str,
+    ) -> None:
+        """Log the station-feed song currently named by an ICY stream.
+
+        :param streamdetails: The active stream carrying the matched title.
+        :param play: The exact station-feed entry matched to that title.
+        :param station_slug: Log-server slug for the station.
+        """
+        data = streamdetails.data or {}
+        queue_id = str(
+            getattr(streamdetails, "queue_id", None)
+            or data.get(STATION_QUEUE_ID_KEY)
+            or ""
+        )
+        if not queue_id:
+            self.logger.debug("Cannot log radio play without a queue id: %s", play)
+            return
+
+        queue = self.mass.player_queues.get(queue_id)
+        queue_item = getattr(queue, "current_item", None) if queue else None
+        if (
+            queue is None
+            or queue.state is not PlaybackState.PLAYING
+            or queue_item is None
+            or getattr(queue_item, "streamdetails", None) is not streamdetails
+        ):
+            self.logger.debug("Radio play is no longer the active stream: %s", play)
+            return
+
+        media_item = getattr(queue_item, "media_item", None)
+        uri = str(getattr(media_item, "uri", None) or "")
+        if not uri:
+            self.logger.debug("Cannot log radio play without a media URI: %s", play)
+            return
+
+        client_ref = station_play_client_ref(station_slug, play)
+        if (
+            not data.get(STREAMDETAILS_INBAND_TITLE_KEY)
+            or data.get(STREAMDETAILS_INBAND_TITLE_KEY) != data.get(LAST_MATCHED_KEY)
+        ):
+            return
+        self._observe_song(queue_id, queue, wake=False)
+        session = getattr(self, "_current_plays", {}).get(queue_id)
+        listen = session.get("radio_listen") if session else None
+        if (
+            session is None
+            or listen is None
+            or session.get("radio_identity") != client_ref
+            or not listen.due
+        ):
+            return
+        key = (queue_id, client_ref)
+        inflight: set[tuple[str, str]] = getattr(self, "_radio_log_inflight", set())
+        if data.get(LAST_RADIO_PLAY_REF_KEY) == client_ref or key in inflight:
+            return
+        inflight.add(key)
+
+        try:
+            config = self._scrobbler_config
+            queue_data = self.mass.player_queues.queue_data_or_none(queue_id)
+            userid = queue_data.userid if queue_data else None
+            if config.mass_userids and userid not in config.mass_userids:
+                self.logger.debug("skipped radio play for user %s", userid)
+                return
+            if config.mass_playerids and queue_id not in config.mass_playerids:
+                self.logger.debug("skipped radio play for player %s", queue_id)
+                return
+
+            raw_played_at = play.get("played_at")
+            if raw_played_at is None:
+                self.logger.warning("Skipping radio play without a timestamp: %s", play)
+                return
+            try:
+                played_at = datetime.fromtimestamp(float(raw_played_at), tz=UTC)
+            except (TypeError, ValueError, OSError):
+                self.logger.warning("Skipping radio play with invalid timestamp: %s", play)
+                return
+
+            artist = str(play.get("artist") or "").strip()
+            title = str(play.get("title") or "").strip()
+            if not artist or not title:
+                self.logger.debug("Skipping incomplete radio play: %s", play)
+                return
+            if not listen.claim():
+                return
+            duration_raw = play.get("duration_s")
+            try:
+                duration_s = int(duration_raw) if duration_raw else None
+            except (TypeError, ValueError):
+                duration_s = None
+
+            # Reuse the normal payload builder so radio rows retain the same
+            # provider, player, quality, place and weather fields as tracks.
+            self._quality.remember(uri, streamdetails)
+            report = SimpleNamespace(
+                player_id=queue_id,
+                uri=uri,
+                media_type=MediaType.RADIO,
+                name=str(data.get(STATION_NAME_KEY) or station_slug),
+                artist=artist,
+                title=title,
+                album=play.get("album"),
+                duration=duration_s,
+                image_url=play.get("artwork_url"),
+                version=None,
+                mbid=None,
+                artist_mbids=None,
+                album_mbid=None,
+            )
+            payload = self._build_payload(
+                cast("MediaItemPlaybackProgressReport", report),
+                played_at=played_at,
+                duration_s=duration_s,
+                source_type="radio",
+                artist=artist,
+                title=title,
+                album=play.get("album"),
+                client_ref=client_ref,
+            )
+            # The stream metadata we just filled is the song, not the
+            # programme. Do not accidentally publish the song title as a DJ or
+            # show name; feed fields win when a station supplies them.
+            payload["show_name"] = named_show(play.get("show_name"))
+            payload["dj_name"] = play.get("dj_name") or None
+            payload["source_confidence"] = "exact"
+            payload.update(await self._weather_snapshot())
+
+            # Marks tapped while the song is live should target this exact
+            # station airing, not the provisional MA queue reference assigned
+            # before the station feed had resolved the title.
+            session = getattr(self, "_current_plays", {}).get(queue_id)
+            if session and session.get("uri") == uri:
+                session["client_ref"] = client_ref
+
+            data[LAST_RADIO_PLAY_REF_KEY] = client_ref
+            if await self._push(payload):
+                await self._backlog.drain(self._push)
+            else:
+                await self._backlog.append(payload)
+        finally:
+            inflight.discard(key)
 
     async def _station_plays(self, slug: str) -> list[dict[str, Any]]:
         """
@@ -617,12 +911,11 @@ class ListeningHabitsProvider(PluginProvider):
         return False
 
     async def _on_media_item_played(self, event: MassEvent) -> None:
-        """Handle a finished media item by logging it."""
+        """Handle playback progress and log eligible media items."""
         report: MediaItemPlaybackProgressReport = event.data
-        # This fires once per finished item, not once per progress tick, so an
-        # unconditional line here is cheap -- and without it a play that got
-        # filtered out is indistinguishable from an event that never arrived,
-        # which is the hardest kind of silence to debug.
+        # MA sends periodic progress reports as well as completion reports.
+        # Keep filter decisions visible so an excluded play is distinguishable
+        # from a progress event that never arrived.
         self.logger.debug(
             "played event: %s - %s (%s, fully_played=%s, is_playing=%s, player=%s)",
             report.artist,
@@ -655,6 +948,36 @@ class ListeningHabitsProvider(PluginProvider):
             await self._handle_podcast_report(report)
             return
 
+        if report.media_type is MediaType.RADIO:
+            queue = self.mass.player_queues.get(str(report.player_id or ""))
+            if queue is not None:
+                self._observe_song(str(report.player_id or ""), queue)
+            return
+
+        if report.media_type is MediaType.TRACK:
+            session = self._song_session_for_report(report)
+            if session is None:
+                return
+            session["song_report"] = report
+            listen = session.get("song_listen")
+            if listen is not None:
+                listen.observe(float(report.seconds_played or 0), report.is_playing, time.monotonic())
+            await self._log_track_play(report, session)
+            queue = self.mass.player_queues.get(str(report.player_id or ""))
+            current = getattr(queue, "current_item", None) if queue else None
+            if not report.is_playing and (
+                current is None
+                or str(getattr(current, "queue_item_id", "")) != session.get("queue_item_id")
+                or getattr(queue, "state", None) is PlaybackState.IDLE
+            ):
+                key = (str(report.player_id or ""), str(report.uri))
+                refs = self._play_refs.get(key, [])
+                if session in refs:
+                    refs.remove(session)
+                if not refs:
+                    self._play_refs.pop(key, None)
+            return
+
         if not self._should_log(report):
             self.logger.debug(
                 "skipped: %s (fully_played=%s, is_playing=%s)",
@@ -674,6 +997,40 @@ class ListeningHabitsProvider(PluginProvider):
         if await self._push(payload):
             # Opportunistic drain: a push that just succeeded is good evidence
             # the server is reachable again.
+            await self._backlog.drain(self._push)
+        else:
+            await self._backlog.append(payload)
+
+    def _song_session_for_report(
+        self, report: MediaItemPlaybackProgressReport
+    ) -> dict[str, Any] | None:
+        """Resolve current or ending track reports without consuming an early log's reference."""
+        queue_id = str(report.player_id or "")
+        current = self._current_plays.get(queue_id)
+        if report.is_playing and current and current.get("uri") == report.uri:
+            return current
+        refs = self._play_refs.get((queue_id, str(report.uri)), [])
+        return refs[0] if refs else None
+
+    async def _log_track_play(
+        self, report: MediaItemPlaybackProgressReport, session: dict[str, Any]
+    ) -> None:
+        """Publish one song after a minute, not again at track completion."""
+        cfg = self._scrobbler_config
+        if (cfg.mass_userids and report.userid not in cfg.mass_userids) or (
+            cfg.mass_playerids and report.player_id not in cfg.mass_playerids
+        ):
+            return
+        listen = session.get("song_listen")
+        if self.unloading or listen is None or not listen.claim():
+            return
+        payload = self._build_payload(
+            report,
+            client_ref=str(session["client_ref"]),
+            played_at=datetime.fromtimestamp(listen.started_at, tz=UTC),
+        )
+        payload.update(await self._weather_snapshot())
+        if await self._push(payload):
             await self._backlog.drain(self._push)
         else:
             await self._backlog.append(payload)
@@ -1469,10 +1826,8 @@ class ListeningHabitsProvider(PluginProvider):
         """
         Report ingest health, for the frontend's Now Playing indicator.
 
-        Deliberately says nothing about the *current* track. The provider logs
-        on completion, so mid-play there is nothing yet to report about it --
-        what a listener can actually use here is whether the pipe is open and
-        whether anything is stuck behind it.
+        Reports the logging policy and submission health, not the current
+        song. Now Playing metadata remains independent of log qualification.
 
         Never returns the token, only whether one is set.
         """
@@ -1480,6 +1835,7 @@ class ListeningHabitsProvider(PluginProvider):
         session = await self._server_session_status()
         return {
             "configured": bool(self._endpoint and self._token),
+            "song_log_after_s": SONG_LOG_THRESHOLD_S,
             "endpoint": self._endpoint or None,
             "healthy": self._last_result in (None, "ok"),
             "backlog": await self._backlog.depth(),
