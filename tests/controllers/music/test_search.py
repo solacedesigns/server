@@ -117,6 +117,9 @@ def _make_controller(providers: list[Mock]) -> MusicController:
         return_value=[p.instance_id for p in providers]
     )
     controller.search_library = AsyncMock(return_value=SearchResults())  # type: ignore[method-assign]
+    controller.get_active_provider_instances = Mock(  # type: ignore[method-assign]
+        return_value=[p.instance_id for p in providers]
+    )
     return controller
 
 

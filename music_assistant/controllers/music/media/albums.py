@@ -371,13 +371,23 @@ class AlbumsController(MediaControllerBase[Album]):
         item_id: str,
         provider_instance_id_or_domain: str,
         in_library_only: bool = False,
+        provider_only: bool = False,
     ) -> list[Track]:
-        """Return album tracks for the given provider album id."""
+        """
+        Return album tracks for the given provider album id.
+
+        :param item_id: Album identifier.
+        :param provider_instance_id_or_domain: Album provider.
+        :param in_library_only: Restrict automatic expansion to saved library tracks.
+        :param provider_only: Fetch only this provider's album, without merging library versions.
+        """
+        if provider_only and provider_instance_id_or_domain == "library":
+            raise MediaNotFoundError("Choose a provider album for provider-only expansion.")
         # always check if we have a library item for this album
         library_album = await self.get_library_item_by_prov_id(
             item_id, provider_instance_id_or_domain
         )
-        if not library_album:
+        if not library_album or provider_only:
             album_tracks = await self._get_provider_album_tracks(
                 item_id, provider_instance_id_or_domain
             )

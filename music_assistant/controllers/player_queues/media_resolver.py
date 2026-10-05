@@ -163,6 +163,7 @@ class MediaResolver:
         start_item: str | None,
         sort_by: str | None = None,
         keep_preceding_items: bool = False,
+        provider_only: bool = False,
     ) -> list[Track]:
         """
         Return tracks for given album, based on user preference.
@@ -172,6 +173,7 @@ class MediaResolver:
         :param sort_by: Optional sort key to order the tracks by before applying start_item.
         :param keep_preceding_items: Move the tracks before start_item behind the rest instead
             of dropping them, so the full album is returned with start_item first.
+        :param provider_only: Expand only the explicitly requested provider's album.
         """
         album_items_conf = self.mass.config.get_raw_core_config_value(
             self.queues.domain,
@@ -187,6 +189,7 @@ class MediaResolver:
             item_id=album.item_id,
             provider_instance_id_or_domain=album.provider,
             in_library_only=album_items_conf == "library_tracks",
+            provider_only=provider_only,
         ):
             if not album_track.available:
                 continue
@@ -673,6 +676,7 @@ class MediaResolver:
         sort_by: str | None = None,
         start_from_beginning: bool = False,
         keep_preceding_items: bool = False,
+        provider_only: bool = False,
     ) -> list[MediaItemType]:
         """
         Resolve/unwrap media items to enqueue.
@@ -687,6 +691,7 @@ class MediaResolver:
         :param keep_preceding_items: For a playlist/album, move the tracks before start_item
             behind the rest instead of dropping them, so the full item is returned with
             start_item first.
+        :param provider_only: Expand only the requested provider's album version.
         """
         # resolve Itemmapping to full media item
         if isinstance(media_item, ItemMapping):
@@ -720,6 +725,7 @@ class MediaResolver:
                     start_item,
                     sort_by=sort_by,
                     keep_preceding_items=keep_preceding_items,
+                    provider_only=provider_only,
                 )
             )
         if media_item.media_type == MediaType.GENRE:

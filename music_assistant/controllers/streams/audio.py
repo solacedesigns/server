@@ -90,6 +90,7 @@ from music_assistant.constants import (
     STREAM_START_TIMEOUT,
     VERBOSE_LOG_LEVEL,
 )
+from music_assistant.controllers.player_queues.provider_selection import allowed_providers
 from music_assistant.controllers.streams.audio_analysis import (
     LOUDNESS_ANALYSIS_DOMAIN,
 )
@@ -617,6 +618,7 @@ class StreamsAudio:
         :param excluded_provider_instances: Provider instances to skip during this selection.
         """
         mass = self.mass
+        restricted_providers = allowed_providers(queue_item)
         streamdetails: StreamDetails | None = None
         excluded_provider_instances = excluded_provider_instances or set()
         time_start = time.time()
@@ -633,6 +635,10 @@ class StreamsAudio:
             queue_item.streamdetails
             # cached details of an excluded instance are exactly what we select away from
             and queue_item.streamdetails.provider not in excluded_provider_instances
+            and (
+                restricted_providers is None
+                or queue_item.streamdetails.provider in restricted_providers
+            )
             and (
                 # reuse if the buffer can serve this seek position (fast seek path)
                 (
@@ -664,6 +670,7 @@ class StreamsAudio:
                 media_item.provider_mappings,
                 preferred_providers,
                 excluded_provider_instances,
+                restricted_providers,
             )
             streamdetails = await self._request_streamdetails(candidates, media_item.media_type)
 
@@ -3356,6 +3363,14 @@ class StreamsAudio:
         loop = asyncio.get_running_loop()
         # the playback intent lives on the details we start from; keep it across a reselection
         initial_streamdetails = queue_item.streamdetails
+        restricted_providers = allowed_providers(queue_item)
+        if (
+            initial_streamdetails
+            and restricted_providers is not None
+            and initial_streamdetails.provider not in restricted_providers
+        ):
+            queue_item.streamdetails = None
+            initial_streamdetails = None
         seek_position = (
             int(initial_streamdetails.seek_position)
             if initial_streamdetails
@@ -3372,6 +3387,7 @@ class StreamsAudio:
             )
             if mapping.available
             for provider in self._get_mapping_providers(mapping)
+            if restricted_providers is None or provider.instance_id in restricted_providers
         }
         if initial_streamdetails is not None:
             all_candidate_instances.add(initial_streamdetails.provider)
@@ -3379,6 +3395,7 @@ class StreamsAudio:
         # match is only searched once, and only when every known candidate is saturated
         match_pending = (
             allow_provider_match
+            and restricted_providers is None
             and isinstance(queue_item.media_item, Track)
             and self._has_alternative_match_providers(queue_item.media_item)
         )
@@ -3480,6 +3497,7 @@ class StreamsAudio:
         provider_mappings: Iterable[ProviderMapping],
         preferred_providers: list[str],
         excluded_provider_instances: set[str],
+        allowed_provider_instances: set[str] | None = None,
     ) -> list[tuple[ProviderMapping, Provider]]:
         """
         Return mapping candidates in steering, quality, and instance-fallback order.
@@ -3487,6 +3505,7 @@ class StreamsAudio:
         :param provider_mappings: Mappings attached to the media item.
         :param preferred_providers: Provider instances tried before widening to the rest.
         :param excluded_provider_instances: Provider instances unavailable to this attempt.
+        :param allowed_provider_instances: Explicitly allowed instances, or None for automatic.
         :return: Ordered provider mapping candidates.
         """
         ordered_mappings = sorted(
@@ -3504,6 +3523,10 @@ class StreamsAudio:
                 if (
                     candidate_id in seen_candidates
                     or provider.instance_id in excluded_provider_instances
+                    or (
+                        allowed_provider_instances is not None
+                        and provider.instance_id not in allowed_provider_instances
+                    )
                 ):
                     continue
                 seen_candidates.add(candidate_id)

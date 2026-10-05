@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, cast
 from music_assistant_models.enums import (
     MediaType,
     PlaybackState,
+    ProviderType,
     QueueOption,
     RepeatMode,
 )
@@ -59,6 +60,7 @@ from music_assistant.controllers.player_queues.helpers import (
     is_dynamic_source,
 )
 from music_assistant.controllers.player_queues.managed_pool import gate_tracks
+from music_assistant.controllers.player_queues.provider_selection import restrict_queue_item
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     get_current_user,
     set_current_user,
@@ -698,8 +700,21 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         sort_by: str | None = None,
         start_from_beginning: bool = False,
         shuffle: bool | None = None,
+        allowed_provider_instances: list[str] | None = None,
     ) -> None:
         """Handle play media without acquiring the queue lock."""
+        if allowed_provider_instances is not None:
+            permitted = {
+                provider.instance_id
+                for provider in self.mass.get_providers(ProviderType.MUSIC)
+                if provider.available
+            }
+            if not allowed_provider_instances or not set(allowed_provider_instances) <= permitted:
+                raise InvalidDataError("A selected provider is unavailable or not permitted.")
+            if radio_mode or option not in (QueueOption.REPLACE, QueueOption.PLAY):
+                raise InvalidDataError(
+                    "Restricted playback requires a finite play/replace request."
+                )
         # cancel any pending play_index calls for this queue to prevent conflicts
         self.mass.cancel_timer(f"queue_play_index_{queue_id}")
         self._set_transitioning(queue_id, False)
@@ -789,6 +804,33 @@ class QueueLoaderMixin(_PlayerQueuesBase):
                     if media_item.uri is None:
                         raise InvalidDataError("ItemMapping has no URI")
                     media_item = await self.mass.music.get_item_by_uri(media_item.uri)
+
+                if allowed_provider_instances is not None:
+                    if isinstance(media_item, BrowseFolder) or is_dynamic_source(media_item):
+                        raise InvalidDataError(
+                            "Provider restrictions do not support dynamic sources."
+                        )
+                    if len(allowed_provider_instances) == 1 and media_item.media_type in (
+                        MediaType.ALBUM,
+                        MediaType.PLAYLIST,
+                        MediaType.PODCAST,
+                    ):
+                        instance = allowed_provider_instances[0]
+                        mapping = next(
+                            (
+                                m
+                                for m in media_item.provider_mappings
+                                if m.available and m.provider_instance == instance
+                            ),
+                            None,
+                        )
+                        if mapping is None:
+                            raise MediaNotFoundError(
+                                "This collection is not on the selected provider."
+                            )
+                        media_item = await self.mass.music.get_controller(
+                            media_item.media_type
+                        ).get_provider_item(mapping.item_id, instance)
 
                 # handle default enqueue option if needed
                 if option is None:
@@ -906,12 +948,22 @@ class QueueLoaderMixin(_PlayerQueuesBase):
                         # whole playlist/album (chosen track first) instead of dropping everything
                         # before it - the chosen track is pinned in front of the shuffled rest
                         keep_preceding_items=queue.shuffle_enabled,
+                        provider_only=allowed_provider_instances is not None
+                        and len(allowed_provider_instances) == 1,
                     )
+                    if allowed_provider_instances is not None:
+                        for resolved in resolved_items:
+                            restrict_queue_item(
+                                build_queue_item(queue_id, cast("PlayableMediaItemType", resolved)),
+                                allowed_provider_instances,
+                            )
                     media_items += resolved_items
                     if plays_next_track:
                         play_next_items += resolved_items
 
             except MusicAssistantError as err:
+                if allowed_provider_instances is not None:
+                    raise
                 # invalid MA uri or item not found error
                 self.logger.warning("Skipping %s: %s", item, str(err))
 
@@ -957,6 +1009,10 @@ class QueueLoaderMixin(_PlayerQueuesBase):
 
         if not queue_items:
             raise MediaNotFoundError("No playable items found", translation_key="no_playable_items")
+
+        if allowed_provider_instances is not None:
+            for queue_item in queue_items:
+                restrict_queue_item(queue_item, allowed_provider_instances)
 
         await self._enqueue_with_option(
             queue_id, queue_items, option, pin_first=start_item is not None

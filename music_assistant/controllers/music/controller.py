@@ -477,7 +477,12 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                 priority=(ProviderType.PLUGIN,),
             )
         ]
-        all_search_providers = sorted(self.get_unique_providers() + plugin_search_providers)
+        music_search_providers = (
+            self.get_active_provider_instances()
+            if providers is not None
+            else self.get_unique_providers()
+        )
+        all_search_providers = sorted(music_search_providers + plugin_search_providers)
         if providers is None:
             include_library = True
             search_providers = all_search_providers
@@ -558,7 +563,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                         provider_instance,
                         prov_media_types,
                         limit=limit,
-                        skip_item_ids=all_prov_item_ids,
+                        skip_item_ids=all_prov_item_ids if include_library else set(),
                     )
                 )
             # include results from all (unique) music providers

@@ -488,6 +488,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         if queue.state == PlaybackState.PLAYING:
             await self.resume(queue_id)
 
+    @api_command("player_queues/provider_selection", required_scope=Scope.LIBRARY_READ)
+    def provider_selection(self) -> dict[str, int]:
+        """Return the supported explicit provider-selection contract version."""
+        return {"version": 1}
+
     @api_command(
         "player_queues/play_media", required_scope=Scope.QUEUES_CONTROL, allow_impersonation=True
     )
@@ -501,6 +506,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         sort_by: str | None = None,
         start_from_beginning: bool = False,
         shuffle: bool | None = None,
+        allowed_provider_instances: list[str] | None = None,
     ) -> None:
         """
         Play media item(s) on the given queue.
@@ -519,6 +525,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             (an always-on smart mix). Omit to follow the queue's own shuffle setting, which media
             with an order of its own (album, podcast, episode, audiobook, audio source) switches
             off; the first item of a batch decides for the whole batch.
+        :param allowed_provider_instances: Exact providers allowed for this request; None
+            keeps automatic selection. An empty list is invalid, never unrestricted.
         """
         self._check_player_permission(queue_id)
         if not self.get(queue_id):
@@ -527,6 +535,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         # keeps its own items. Selecting it is the real operation, so a play request
         # naming one is forwarded there rather than enqueued.
         if (source_uri := await _resolve_audio_source_request(media)) is not None:
+            if allowed_provider_instances is not None:
+                raise InvalidDataError("Provider restrictions do not apply to audio inputs.")
             await self.mass.players.select_source(queue_id, source_uri)
             return
         # Lock is acquired by the @handle_play_action decorator on the internal handler
@@ -539,6 +549,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             sort_by,
             start_from_beginning,
             shuffle,
+            allowed_provider_instances,
         )
 
     @api_command("player_queues/move_item", required_scope=Scope.QUEUES_CONTROL)
