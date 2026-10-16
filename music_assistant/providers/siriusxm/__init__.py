@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Sequence
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 from music_assistant_models.enums import (
     ContentType,
@@ -101,6 +102,8 @@ class SiriusXMProvider(MusicProvider):
             quality=QualitySize.LARGE_256k,
             update_handler=self._channel_updated,
         )
+        self._artwork_url_cache: dict[str, bool] = {}
+        self._pending_artwork_urls: set[str] = set()
 
         self.logger.info("Authenticating with SiriusXM")
         try:
@@ -264,6 +267,7 @@ class SiriusXMProvider(MusicProvider):
             latest_cut = latest_cut_marker.cut
             title = latest_cut.title
             artist = ", ".join([a.name for a in latest_cut.artists])
+            stream_details = self._current_stream_details
             # prefer the album art of the current song, fall back to the channel logo
             image_url: str | None = None
             if isinstance(latest_cut, XMSong) and latest_cut.album:
@@ -276,11 +280,90 @@ class SiriusXMProvider(MusicProvider):
                 # SiriusXM returns http image urls, upgrade to https to prevent
                 # mixed content blocking when the UI is served over https
                 image_url = "https://" + image_url.removeprefix("http://")
-            self._current_stream_details.stream_metadata = StreamMetadata(
+            high_res_check_url: str | None = None
+            if image_url:
+                high_res_url = self._get_high_res_artwork_url(image_url)
+                if high_res_url:
+                    if self._artwork_url_cache.get(high_res_url) is True:
+                        image_url = high_res_url
+                    elif self._artwork_url_cache.get(high_res_url) is None:
+                        if high_res_url not in self._pending_artwork_urls:
+                            self._pending_artwork_urls.add(high_res_url)
+                            high_res_check_url = high_res_url
+            stream_details.stream_metadata = StreamMetadata(
                 title=title,
                 artist=artist,
                 image_url=image_url,
             )
+            if high_res_check_url:
+                self.mass.create_task(
+                    self._check_high_res_artwork(
+                        current_channel,
+                        stream_details,
+                        title,
+                        artist,
+                        image_url,
+                        high_res_check_url,
+                    )
+                )
+
+    @staticmethod
+    def _get_high_res_artwork_url(image_url: str) -> str | None:
+        """Return the larger SiriusXM album-art variant when the URL has one."""
+        image = urlsplit(image_url)
+        if image.hostname != "albumart.siriusxm.com":
+            return None
+        path = image.path
+        for suffix in ("_t.jpg", "_s.jpg", "_t.jpeg", "_s.jpeg", "_t.png", "_s.png"):
+            if path.lower().endswith(suffix):
+                return urlunsplit(
+                    (
+                        image.scheme,
+                        image.netloc,
+                        path[: -len(suffix)] + "_m" + suffix[2:],
+                        image.query,
+                        image.fragment,
+                    )
+                )
+        return None
+
+    async def _check_high_res_artwork(
+        self,
+        channel_id: str,
+        stream_details: StreamDetails,
+        title: str,
+        artist: str,
+        fallback_url: str,
+        high_res_url: str,
+    ) -> None:
+        """Check a larger artwork URL and publish it if it exists."""
+        try:
+            async with self.mass.http_session.head(high_res_url, timeout=5) as response:
+                available = 200 <= response.status < 300
+        except Exception as err:  # noqa: BLE001
+            self.logger.debug("Could not verify SiriusXM artwork URL: %s", err)
+            available = False
+        finally:
+            self._pending_artwork_urls.discard(high_res_url)
+
+        self._artwork_url_cache[high_res_url] = available
+        stream_metadata = stream_details.stream_metadata
+        if (
+            not available
+            or self._current_stream_details is not stream_details
+            or self._current_stream_details.item_id != channel_id
+            or stream_metadata is None
+            or stream_metadata.title != title
+            or stream_metadata.artist != artist
+            or stream_metadata.image_url != fallback_url
+        ):
+            return
+
+        stream_details.stream_metadata = StreamMetadata(
+            title=title,
+            artist=artist,
+            image_url=high_res_url,
+        )
 
     async def _refresh_channels(self) -> bool:
         self._channels = await self._client.channels

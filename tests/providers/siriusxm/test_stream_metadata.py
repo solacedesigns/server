@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -26,6 +27,8 @@ from music_assistant.providers.siriusxm import SiriusXMProvider
 CHANNEL_ID = "9420"
 ALBUM_ART_URL = "https://example.com/album-art.jpg"
 CHANNEL_LOGO_URL = "https://example.com/channel-logo.png"
+SIRIUSXM_THUMB_URL = "https://albumart.siriusxm.com/albumart/2000/example_t.jpg"
+SIRIUSXM_LARGE_URL = "https://albumart.siriusxm.com/albumart/2000/example_m.jpg"
 
 
 def _make_channel() -> XMChannel:
@@ -74,7 +77,7 @@ def _make_live_channel(cut: XMCut) -> XMLiveChannel:
     )
 
 
-def _make_provider() -> Any:
+def _make_provider(high_res_status: int = 404) -> Any:
     provider = MagicMock()
     provider._current_stream_details = StreamDetails(
         item_id=CHANNEL_ID,
@@ -85,6 +88,20 @@ def _make_provider() -> Any:
         path="dummy",
     )
     provider._channels_by_id = {CHANNEL_ID: _make_channel()}
+    provider._artwork_url_cache = {}
+    provider._pending_artwork_urls = set()
+
+    class HeadResponse:
+        status = high_res_status
+
+        async def __aenter__(self) -> HeadResponse:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    provider.mass.http_session.head.return_value = HeadResponse()
+    provider.mass.create_task.side_effect = lambda task: asyncio.run(task)
     return provider
 
 
@@ -146,3 +163,43 @@ def test_channel_update_ignores_other_channel() -> None:
     _run_channel_updated(provider, live_channel)
 
     assert provider._current_stream_details.stream_metadata is None
+
+
+def test_channel_update_uses_verified_larger_siriusxm_art() -> None:
+    """A working larger SiriusXM album-art variant replaces its thumbnail."""
+    provider = _make_provider(high_res_status=200)
+    song = XMSong(
+        title="Test Song",
+        artists=[XMArtist(name="Test Artist")],
+        album=XMAlbum(
+            title="Test Album",
+            arts=[XMArt(name=None, url=SIRIUSXM_THUMB_URL, art_type="IMAGE")],
+        ),
+    )
+
+    _run_channel_updated(provider, _make_live_channel(song))
+
+    metadata = provider._current_stream_details.stream_metadata
+    assert metadata is not None
+    assert metadata.image_url == SIRIUSXM_LARGE_URL
+    provider.mass.http_session.head.assert_called_once_with(SIRIUSXM_LARGE_URL, timeout=5)
+
+
+def test_channel_update_keeps_thumbnail_when_larger_siriusxm_art_is_missing() -> None:
+    """A missing larger variant leaves the original artwork usable."""
+    provider = _make_provider(high_res_status=404)
+    song = XMSong(
+        title="Test Song",
+        artists=[XMArtist(name="Test Artist")],
+        album=XMAlbum(
+            title="Test Album",
+            arts=[XMArt(name=None, url=SIRIUSXM_THUMB_URL, art_type="IMAGE")],
+        ),
+    )
+
+    _run_channel_updated(provider, _make_live_channel(song))
+
+    metadata = provider._current_stream_details.stream_metadata
+    assert metadata is not None
+    assert metadata.image_url == SIRIUSXM_THUMB_URL
+    assert provider._artwork_url_cache[SIRIUSXM_LARGE_URL] is False
