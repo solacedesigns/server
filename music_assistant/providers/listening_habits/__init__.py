@@ -48,7 +48,11 @@ from music_assistant.controllers.streams.constants import (
     STREAMDETAILS_INBAND_TITLE_HANDOFF_KEY,
     STREAMDETAILS_INBAND_TITLE_KEY,
 )
-from music_assistant.helpers.scrobbler import ScrobblerConfig
+from music_assistant.helpers.scrobbler import (
+    CONF_SCROBBLE_PLAYERS,
+    ScrobblerConfig,
+    create_scrobble_players_config_entry,
+)
 from music_assistant.models.plugin import PluginProvider
 
 from .helpers import (
@@ -86,6 +90,7 @@ CONF_ENDPOINT = "endpoint"
 CONF_TOKEN = "_token"
 CONF_HOME_PLACE = "home_place_name"
 CONF_WEATHER_ENTITY = "weather_entity"
+CONF_EXCLUDED_PLAYERS = "exclude_players"
 
 # How often the backlog is retried regardless of new plays, so a queue that
 # built up overnight still drains even if nothing plays for a while.
@@ -264,7 +269,22 @@ class ListeningHabitsProvider(PluginProvider):
         # a required entry with no default makes the provider impossible to
         # load. The endpoint, token and home place are collected by the setup
         # flow into setup_data instead, and read back via get_setup_value.
-        entries = list(await ScrobblerConfig.get_shared_config_entries(self.mass, None))
+        entries = [
+            entry
+            for entry in await ScrobblerConfig.get_shared_config_entries(self.mass, None)
+            if entry.key != CONF_SCROBBLE_PLAYERS
+        ]
+        player_entry = create_scrobble_players_config_entry(self.mass)
+        entries.append(
+            ConfigEntry(
+                key=CONF_EXCLUDED_PLAYERS,
+                type=player_entry.type,
+                options=player_entry.options,
+                multi_value=True,
+                default_value=[],
+                required=False,
+            )
+        )
         weather_entities: list[str] = []
         if hass_provider := self.mass.get_provider("hass"):
             hass = cast("HomeAssistantProvider", hass_provider)
@@ -291,6 +311,10 @@ class ListeningHabitsProvider(PluginProvider):
         self._token = str(self.get_setup_value(CONF_TOKEN) or "").strip()
         self._home_place = str(self.get_setup_value(CONF_HOME_PLACE) or "").strip() or None
         self._weather_entity = str(self.config.get_value(CONF_WEATHER_ENTITY) or "").strip()
+        self._excluded_player_ids = {
+            str(player_id)
+            for player_id in self.config.get_value(CONF_EXCLUDED_PLAYERS, []) or []
+        }
         self._scrobbler_config = ScrobblerConfig.create_from_config(self.config)
         self._backlog = DurableQueue(
             os.path.join(self.mass.storage_path, "listening_habits_queue.jsonl"),
@@ -300,6 +324,10 @@ class ListeningHabitsProvider(PluginProvider):
             self.mass.storage_path, "listening_habits_podcast_sessions.json"
         )
         await asyncio.to_thread(self._load_podcast_sessions)
+
+    def _is_player_excluded(self, player_id: str | None) -> bool:
+        """Return whether the player is opted out of Listening Habits logging."""
+        return bool(player_id and player_id in getattr(self, "_excluded_player_ids", set()))
 
     async def loaded_in_mass(self) -> None:
         """Subscribe to playback events once the provider is live."""
@@ -496,8 +524,8 @@ class ListeningHabitsProvider(PluginProvider):
         cfg = self._scrobbler_config
         queue_data = self.mass.player_queues.queue_data_or_none(queue_id)
         userid = queue_data.userid if queue_data else None
-        if (cfg.mass_userids and userid not in cfg.mass_userids) or (
-            cfg.mass_playerids and queue_id not in cfg.mass_playerids
+        if (cfg.mass_userids and userid not in cfg.mass_userids) or self._is_player_excluded(
+            queue_id
         ):
             return
         listen = session["radio_listen"]
@@ -767,8 +795,8 @@ class ListeningHabitsProvider(PluginProvider):
             if config.mass_userids and userid not in config.mass_userids:
                 self.logger.debug("skipped radio play for user %s", userid)
                 return
-            if config.mass_playerids and queue_id not in config.mass_playerids:
-                self.logger.debug("skipped radio play for player %s", queue_id)
+            if self._is_player_excluded(queue_id):
+                self.logger.debug("skipped radio play for excluded player %s", queue_id)
                 return
 
             raw_played_at = play.get("played_at")
@@ -933,8 +961,8 @@ class ListeningHabitsProvider(PluginProvider):
         if cfg.mass_userids and report.userid not in cfg.mass_userids:
             self.logger.debug("skipped: user %s not in configured users", report.userid)
             return
-        if cfg.mass_playerids and report.player_id not in cfg.mass_playerids:
-            self.logger.debug("skipped: player %s not in configured players", report.player_id)
+        if self._is_player_excluded(report.player_id):
+            self.logger.debug("skipped: player %s is excluded", report.player_id)
             return
 
         if report.media_type is MediaType.SOUND_EFFECT:
@@ -1017,8 +1045,8 @@ class ListeningHabitsProvider(PluginProvider):
     ) -> None:
         """Publish one song after a minute, not again at track completion."""
         cfg = self._scrobbler_config
-        if (cfg.mass_userids and report.userid not in cfg.mass_userids) or (
-            cfg.mass_playerids and report.player_id not in cfg.mass_playerids
+        if (cfg.mass_userids and report.userid not in cfg.mass_userids) or self._is_player_excluded(
+            report.player_id
         ):
             return
         listen = session.get("song_listen")

@@ -15,6 +15,10 @@
     "weather_entity": {
       "label": "Home Assistant weather entity",
       "description": "Current conditions to save with each listen. If unavailable, Music Assistant falls back to Open-Meteo using Home Assistant's home coordinates."
+    },
+    "exclude_players": {
+      "label": "Exclude players from logging",
+      "description": "Selected players will not be logged. Leave empty to log playback from all players."
     }
   },
   "manifest": {
