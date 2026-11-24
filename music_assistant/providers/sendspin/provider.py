@@ -853,7 +853,12 @@ class SendspinProvider(PlayerProvider):
         try:
             await self.server_api.initiate_pairing(
                 client_id,
-                PairingAttempt(PairMethod.PAIRING_PSK, pairing_psk=token.pairing_psk, owner=owner),
+                PairingAttempt(
+                    PairMethod.PAIRING_PSK,
+                    pairing_psk=token.pairing_psk,
+                    client_id=token.client_id,
+                    owner=owner,
+                ),
             )
         except PairingAbortError:
             # Token pairing is single-shot; unpark the connection before surfacing the failure.
