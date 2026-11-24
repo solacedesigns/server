@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING, ClassVar, cast
 from aiosendspin.models import AudioCodec, MediaCommand
 from aiosendspin.models.management import (
     ManagementSetPairingConfigPayload,
-    SetDynamicPinConfig,
-    SetStaticPinConfig,
+    SetDynamicPairingCodeConfig,
+    SetStaticPairingCodeConfig,
     SetUnpairedAccessConfig,
 )
 from aiosendspin.models.types import PairMethod, PlaybackStateType, PlayerCommand, role_family
@@ -205,16 +205,16 @@ _MANAGEMENT_ACTIONS = {
         unpaired_access=SetUnpairedAccessConfig(enabled=False)
     ),
     CONF_ACTION_MANAGEMENT_STATIC_PIN_ENABLE: ManagementSetPairingConfigPayload(
-        static_pin=SetStaticPinConfig(enabled=True)
+        static_pairing_code=SetStaticPairingCodeConfig(enabled=True)
     ),
     CONF_ACTION_MANAGEMENT_STATIC_PIN_DISABLE: ManagementSetPairingConfigPayload(
-        static_pin=SetStaticPinConfig(enabled=False)
+        static_pairing_code=SetStaticPairingCodeConfig(enabled=False)
     ),
     CONF_ACTION_MANAGEMENT_DYNAMIC_PIN_ENABLE: ManagementSetPairingConfigPayload(
-        dynamic_pin=SetDynamicPinConfig(enabled=True)
+        dynamic_pairing_code=SetDynamicPairingCodeConfig(enabled=True)
     ),
     CONF_ACTION_MANAGEMENT_DYNAMIC_PIN_DISABLE: ManagementSetPairingConfigPayload(
-        dynamic_pin=SetDynamicPinConfig(enabled=False)
+        dynamic_pairing_code=SetDynamicPairingCodeConfig(enabled=False)
     ),
 }
 
