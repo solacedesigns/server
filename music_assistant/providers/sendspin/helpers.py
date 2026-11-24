@@ -43,10 +43,16 @@ _PAIR_ABORT_KEYS = {
     PairAbortReason.ATTEMPT_TIMEOUT: "pairing_error_timeout",
     PairAbortReason.CONCURRENT_ATTEMPT: "pairing_error_concurrent",
     PairAbortReason.METHOD_NOT_SUPPORTED: "pairing_error_method_unsupported",
-    PairAbortReason.PIN_LENGTH_UNACCEPTABLE: "pairing_error_pin_length",
-    PairAbortReason.PIN_MISMATCH: "pairing_error_pin_mismatch",
     PairAbortReason.USER_CANCELLED: "pairing_error_cancelled",
 }
+# Pairing PIN abort values existed in older aiosendspin versions; newer releases
+# report the more general pairing-code mismatch reason instead.
+for _legacy_reason, _alert_key in (
+    ("PIN_LENGTH_UNACCEPTABLE", "pairing_error_pin_length"),
+    ("PIN_MISMATCH", "pairing_error_pin_mismatch"),
+):
+    if _reason := getattr(PairAbortReason, _legacy_reason, None):
+        _PAIR_ABORT_KEYS[_reason] = _alert_key
 
 
 def error_alert(err: Exception) -> AlertText:
