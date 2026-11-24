@@ -1215,7 +1215,7 @@ class SendspinPlayer(SendspinBasePlayer):
         }
         # Keep volume/mute features of the first registration as a workaround for Cast.
         if hello_payload.player_support:
-            _supported_commands = hello_payload.player_support.supported_commands
+            _supported_commands = hello_payload.player_support.supported_commands or []
             if PlayerCommand.VOLUME in _supported_commands:
                 self._attr_supported_features.add(PlayerFeature.VOLUME_SET)
             if PlayerCommand.MUTE in _supported_commands:
@@ -1928,7 +1928,7 @@ class SendspinPlayer(SendspinBasePlayer):
             "int",
             self.config.get_value(CONF_SENDSPIN_STATIC_DELAY, self.static_delay_default_ms),
         )
-        player_role.set_static_delay(config_value)
+        player_role.set_output_delay(config_value)
 
     async def _send_album_artwork(self, current_media: PlayerMedia) -> str | None:
         """
