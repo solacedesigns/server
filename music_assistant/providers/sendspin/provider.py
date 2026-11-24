@@ -467,9 +467,6 @@ class SendspinProvider(PlayerProvider):
             pairing_store=pairing_store,
             allow_unencrypted=allow_legacy_clients,
             allow_noncompliant_clients=allow_legacy_clients,
-            min_pin_length=cast(
-                "int", self.config.get_value(CONF_MIN_PIN_LENGTH, DEFAULT_MIN_PIN_LENGTH)
-            ),
         )
         # Pitch (YINFFT) is the heaviest visualizer DSP and result quality is
         # still very mixed, needs more testing. Disable it globally for now to
