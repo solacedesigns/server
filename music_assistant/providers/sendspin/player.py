@@ -55,7 +55,7 @@ from aiosendspin.server.roles import (
 )
 from aiosendspin.server.roles.color.state import Color
 from aiosendspin.server.roles.metadata.state import Metadata
-from aiosendspin.server.roles.player.events import StaticDelayChangedEvent
+from aiosendspin.server.roles.player.events import OutputDelayChangedEvent
 from aiosendspin.server.roles.player.types import PlayerRoleProtocol
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.constants import PLAYER_CONTROL_NONE
@@ -1311,8 +1311,8 @@ class SendspinPlayer(SendspinBasePlayer):
                 self._attr_volume_level = volume
                 self._attr_volume_muted = muted
                 self.update_state()
-            case StaticDelayChangedEvent(static_delay_ms=delay_ms):
-                self.logger.debug("Static delay changed to %d ms", delay_ms)
+            case OutputDelayChangedEvent(output_delay_ms=delay_ms):
+                self.logger.debug("Output delay changed to %d ms", delay_ms)
                 current = self.config.get_value(
                     CONF_SENDSPIN_STATIC_DELAY, self.static_delay_default_ms
                 )
