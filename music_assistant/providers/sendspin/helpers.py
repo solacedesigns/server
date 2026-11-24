@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from aiosendspin.models.core import PairMethodDescriptor
+from aiosendspin.models.core import PairMethodDescriptor, SupportedPairMethods
 from aiosendspin.models.types import PairAbortReason, PairMethod
 from aiosendspin.noise.driver import HandshakeAbortedError
 from aiosendspin.noise.pairing import PairingAbortError, PairingError, PairingTimeoutError
@@ -37,6 +37,17 @@ class AlertText:
 
     key: str
     params: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class EffectivePairMethod:
+    """A normalized view of a client's advertised pairing method."""
+
+    method: PairMethod
+    locations: list[str] | None = None
+    out_channels: list[str] | None = None
+    formats: list[str] | None = None
+    min_pin_length: int | None = None
 
 
 _PAIR_ABORT_KEYS = {
@@ -87,30 +98,51 @@ def action_entry(action: str, *, advanced: bool = False) -> ConfigEntry:
 
 def effective_pair_methods(
     info: ClientHelloPayload | None, config: ManagementResultData | None
-) -> list[PairMethodDescriptor]:
-    """
-    Return the pairing methods the device currently offers.
-
-    A pairing config fetched over a management session on the current connection is
-    authoritative; the hello advertisement cannot reflect config changes until reconnect.
-    Methods the config enables beyond the hello get a synthesized descriptor.
-    """
-    hello_methods = list(info.supported_pair_methods or []) if info is not None else []
+) -> list[EffectivePairMethod]:
+    """Return the pairing methods the device currently offers."""
+    hello_methods: list[EffectivePairMethod] = []
+    supported = info.supported_pair_methods if info is not None else None
+    if isinstance(supported, SupportedPairMethods):
+        for method, key in (
+            (PairMethod.PAIRING_PSK, "pairing_psk"),
+            (PairMethod.STATIC_PAIRING_CODE, "static_pairing_code"),
+            (PairMethod.DYNAMIC_PAIRING_CODE, "dynamic_pairing_code"),
+        ):
+            descriptor = getattr(supported, key)
+            if descriptor is not None:
+                hello_methods.append(
+                    EffectivePairMethod(
+                        method=method,
+                        locations=getattr(descriptor, "locations", None),
+                        out_channels=getattr(descriptor, "out_channels", None),
+                        formats=getattr(descriptor, "formats", None),
+                    )
+                )
+    elif supported is not None:
+        hello_methods = [
+            EffectivePairMethod(
+                method=descriptor.method,
+                locations=getattr(descriptor, "locations", None),
+                out_channels=getattr(descriptor, "out_channels", None),
+                formats=getattr(descriptor, "formats", None),
+                min_pin_length=getattr(descriptor, "min_pin_length", None),
+            )
+            for descriptor in supported
+        ]
     if config is None:
         return hello_methods
     advertised = {descriptor.method: descriptor for descriptor in hello_methods}
-    methods: list[PairMethodDescriptor] = []
+    methods: list[EffectivePairMethod] = []
     for method, method_config in (
         (PairMethod.PAIRING_PSK, config.pairing_psk),
-        (PairMethod.STATIC_PIN, config.static_pin),
-        (PairMethod.DYNAMIC_PIN, config.dynamic_pin),
+        (PairMethod.STATIC_PAIRING_CODE, getattr(config, "static_pairing_code", None)),
+        (PairMethod.DYNAMIC_PAIRING_CODE, getattr(config, "dynamic_pairing_code", None)),
     ):
         if method_config is None or not method_config.enabled:
             continue
-        descriptor = advertised.get(method) or PairMethodDescriptor(method=method)
-        methods.append(replace(descriptor, min_pin_length=method_config.min_pin_length))
+        descriptor = advertised.get(method) or EffectivePairMethod(method=method)
+        methods.append(descriptor)
     return methods
-
 
 def negotiated_pin_length(descriptor: PairMethodDescriptor | None, server_min: int) -> int:
     """
