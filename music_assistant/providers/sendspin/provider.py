@@ -22,6 +22,7 @@ from aiosendspin.models.types import (
     AudioCodec,
     ManagementResult,
     PairAbortReason,
+    PairingCodeFormat,
     PairMethod,
     PlayerCommand,
     role_family,
@@ -791,16 +792,8 @@ class SendspinProvider(PlayerProvider):
             raise SecurityActionError("pairing_error_not_connected")
         offered = effective_pair_methods(info, self.pairing_config_snapshot(client_id))
         method = self._pick_pin_method(offered, verify=verify, static=static)
-        pin_length = (
-            # From the hello advertisement, not the live config: that is what the server's own
-            # negotiation reads, so the predicted length matches the PIN the device derives.
-            negotiated_pin_length(
-                pair_method_descriptor(info.supported_pair_methods or (), PairMethod.DYNAMIC_PIN),
-                self.server_api.min_pin_length,
-            )
-            if method is PairMethod.DYNAMIC_PIN
-            else None
-        )
+        # Ignore the removed server-side minimum PIN-length setting.
+        pin_length = None
         session = PinPairingSession(
             client_id=client_id,
             method=method,
@@ -1273,11 +1266,11 @@ class SendspinProvider(PlayerProvider):
         """
         wanted: tuple[PairMethod, ...]
         if verify:
-            wanted = (PairMethod.DYNAMIC_PIN,)
+            wanted = (PairMethod.DYNAMIC_PAIRING_CODE,)
         elif static:
-            wanted = (PairMethod.STATIC_PIN,)
+            wanted = (PairMethod.STATIC_PAIRING_CODE,)
         else:
-            wanted = (PairMethod.DYNAMIC_PIN, PairMethod.STATIC_PIN)
+            wanted = (PairMethod.DYNAMIC_PAIRING_CODE, PairMethod.STATIC_PAIRING_CODE)
         offered_methods = {descriptor.method for descriptor in offered}
         for method in wanted:
             if method in offered_methods:
@@ -1335,7 +1328,7 @@ class SendspinProvider(PlayerProvider):
             session.pin_request_event.set()
             return session.pin_future
 
-        def on_pair_pending() -> None:
+        def on_pair_pending(_client_id: str | None = None) -> None:
             session.gesture_event.set()
 
         try:
@@ -1343,12 +1336,11 @@ class SendspinProvider(PlayerProvider):
                 session.client_id,
                 PairingAttempt(
                     session.method,
-                    pin_provider=pin_provider,
-                    verify=session.verify,
+                    pairing_code_provider=pin_provider,
+                    pairing_format=PairingCodeFormat.DIGITS
+                    if session.method is PairMethod.DYNAMIC_PAIRING_CODE
+                    else None,
                     on_pair_pending=on_pair_pending,
-                    languages=self._spoken_pin_languages()
-                    if session.method is PairMethod.DYNAMIC_PIN
-                    else (),
                 ),
             )
         except PairingTimeoutError as err:
