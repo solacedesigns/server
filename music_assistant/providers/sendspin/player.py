@@ -238,7 +238,7 @@ _PAIRING_ABORT_REASONS = {
 # configured secret is found, or which channel conveys a per-session PIN. Values outside these
 # maps render nothing.
 _SECRET_HINT_LABELS = {
-    PairMethod.STATIC_PIN: {
+    PairMethod.STATIC_PAIRING_CODE: {
         "device": "static_pin_location_device",
         "leaflet": "static_pin_location_leaflet",
         "operator": "static_pin_location_operator",
@@ -248,7 +248,7 @@ _SECRET_HINT_LABELS = {
         "leaflet": "pairing_psk_location_leaflet",
         "operator": "pairing_psk_location_operator",
     },
-    PairMethod.DYNAMIC_PIN: {
+    PairMethod.DYNAMIC_PAIRING_CODE: {
         "display": "dynamic_pin_channel_display",
         "speaker": "dynamic_pin_channel_speaker",
     },
@@ -889,14 +889,14 @@ class SendspinBasePlayer(Player):
             entries.append(action_entry(action))
         entries.extend(
             SendspinBasePlayer._management_pin_method_entries(
-                config.static_pin,
+                config.static_pairing_code,
                 CONF_ACTION_MANAGEMENT_STATIC_PIN_ENABLE,
                 CONF_ACTION_MANAGEMENT_STATIC_PIN_DISABLE,
             )
         )
         entries.extend(
             SendspinBasePlayer._management_pin_method_entries(
-                config.dynamic_pin,
+                config.dynamic_pairing_code,
                 CONF_ACTION_MANAGEMENT_DYNAMIC_PIN_ENABLE,
                 CONF_ACTION_MANAGEMENT_DYNAMIC_PIN_DISABLE,
             )
@@ -957,13 +957,13 @@ class SendspinBasePlayer(Player):
         usable_pin_methods = {
             descriptor.method
             for descriptor in pair_methods
-            if descriptor.method in (PairMethod.DYNAMIC_PIN, PairMethod.STATIC_PIN)
+            if descriptor.method in (PairMethod.DYNAMIC_PAIRING_CODE, PairMethod.STATIC_PAIRING_CODE)
         }
         options: list[str] = []
         if usable_pin_methods:
             # Static PIN is only a distinct, meaningful choice when both PIN methods are usable;
             # opposite it the other option names the dynamic PIN rather than PINs in general.
-            both_pin_methods = usable_pin_methods >= {PairMethod.DYNAMIC_PIN, PairMethod.STATIC_PIN}
+            both_pin_methods = usable_pin_methods >= {PairMethod.DYNAMIC_PAIRING_CODE, PairMethod.STATIC_PAIRING_CODE}
             options.append(PAIR_METHOD_DYNAMIC_PIN if both_pin_methods else PAIR_METHOD_PIN)
             if both_pin_methods:
                 options.append(PAIR_METHOD_STATIC_PIN)
@@ -993,11 +993,11 @@ class SendspinBasePlayer(Player):
         info = self.api.info_or_none
         pairing_config = provider.pairing_config_snapshot(self.player_id)
         offers_dynamic_pin = any(
-            descriptor.method is PairMethod.DYNAMIC_PIN
+            descriptor.method is PairMethod.DYNAMIC_PAIRING_CODE
             for descriptor in effective_pair_methods(info, pairing_config)
         )
         # presence proven by a dynamic-PIN pairing itself needs no re-verification
-        if not offers_dynamic_pin or PairMethod.DYNAMIC_PIN in record.pair_methods:
+        if not offers_dynamic_pin or PairMethod.DYNAMIC_PAIRING_CODE in record.pair_methods:
             raise AbortFlow("already_paired")
         await self._run_pin_pairing_flow(session, provider, static=False, verify=True)
 
@@ -1134,7 +1134,7 @@ class SendspinBasePlayer(Player):
         if descriptor is None:
             return []
         hints = (
-            descriptor.out_channels if method is PairMethod.DYNAMIC_PIN else descriptor.locations
+            descriptor.out_channels if method is PairMethod.DYNAMIC_PAIRING_CODE else descriptor.locations
         )
         labels = _SECRET_HINT_LABELS[method]
         return [
