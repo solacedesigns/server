@@ -1213,13 +1213,26 @@ class SendspinPlayer(SendspinBasePlayer):
             PlayerFeature.SET_MEMBERS,
             PlayerFeature.MULTI_DEVICE_DSP,
         }
-        # Keep volume/mute features of the first registration as a workaround for Cast.
-        if hello_payload.player_support:
-            _supported_commands = hello_payload.player_support.supported_commands or []
-            if PlayerCommand.VOLUME in _supported_commands:
-                self._attr_supported_features.add(PlayerFeature.VOLUME_SET)
-            if PlayerCommand.MUTE in _supported_commands:
-                self._attr_supported_features.add(PlayerFeature.VOLUME_MUTE)
+        support = hello_payload.player_support
+        hello_commands = support.supported_commands if support is not None else None
+        self._uses_state_volume_controls = support is not None and hello_commands is None
+        if self._uses_state_volume_controls and (role := self._player_role) is not None:
+            self._set_volume_control_features(role.state_supported_commands)
+            self._attr_volume_level = role.get_player_volume()
+            self._attr_volume_muted = role.get_player_muted()
+        elif hello_commands is not None:
+            self._set_volume_control_features(hello_commands)
+
+    def _set_volume_control_features(self, commands: list[PlayerCommand]) -> None:
+        """Expose the volume and mute commands supported by the client."""
+        for command, feature in (
+            (PlayerCommand.VOLUME, PlayerFeature.VOLUME_SET),
+            (PlayerCommand.MUTE, PlayerFeature.VOLUME_MUTE),
+        ):
+            if command in commands:
+                self._attr_supported_features.add(feature)
+            else:
+                self._attr_supported_features.discard(feature)
 
     @property
     def supported_sample_rates(self) -> list[tuple[int, int]] | None:
@@ -1235,6 +1248,8 @@ class SendspinPlayer(SendspinBasePlayer):
 
     def preserve_control_features_from(self, other: SendspinPlayer) -> None:
         """Keep the first registration's volume/mute features as a workaround for Cast."""
+        if self._uses_state_volume_controls:
+            return
         for feature in (PlayerFeature.VOLUME_SET, PlayerFeature.VOLUME_MUTE):
             if feature in other.supported_features:
                 self._attr_supported_features.add(feature)
@@ -1308,6 +1323,8 @@ class SendspinPlayer(SendspinBasePlayer):
         """Event callback registered to the sendspin client."""
         match event:
             case VolumeChangedEvent(volume=volume, muted=muted):
+                if self._uses_state_volume_controls and (role := self._player_role) is not None:
+                    self._set_volume_control_features(role.state_supported_commands)
                 self._attr_volume_level = volume
                 self._attr_volume_muted = muted
                 self.update_state()
