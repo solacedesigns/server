@@ -34,7 +34,7 @@ from aiosendspin.noise.pairing import (
     PairingError,
     PairingTimeoutError,
 )
-from aiosendspin.noise.pairing_token import decode_token
+from aiosendspin.noise.pairing_token import decode_psk_token as decode_token
 from aiosendspin.noise.trust_store import FileServerPairingStore, PskCategory
 from aiosendspin.server import (
     ClientAddedEvent,
